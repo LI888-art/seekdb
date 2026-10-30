@@ -8451,6 +8451,22 @@ COPY '(' select_stmt ')' TO STRING_VALUE
     $$->children_[PARSE_SELECT_INTO_EXTRA] = into_outfile;
   }
 }
+| COPY '(' select_stmt ')' TO STRING_VALUE '(' external_file_format_list ')'
+{
+  $$ = $3;
+  ParseNode *into_outfile = NULL;
+  ParseNode *format_node = NULL;
+  merge_nodes(format_node, result, T_EXTERNAL_FILE_FORMAT, $8);
+  malloc_non_terminal_node(into_outfile, result->malloc_pool_,
+                           T_INTO_OUTFILE, 3, $6, format_node, NULL);
+  if (NULL != $$->children_[PARSE_SELECT_INTO]
+      || NULL != $$->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "COPY target conflicts with existing INTO clause");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = into_outfile;
+  }
+}
 ;
 
 select_stmt:
