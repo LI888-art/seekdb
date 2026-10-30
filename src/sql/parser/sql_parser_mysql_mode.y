@@ -496,7 +496,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
-%type <node> read_csv_expr json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def read_csv_param_list
+%type <node> copy_stmt read_csv_expr json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def read_csv_param_list
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -555,6 +555,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8426,6 +8427,31 @@ expr { $$ = $1;}
  *	select grammar
  *
  *****************************************************************************/
+
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE
+{
+  $$ = $3;
+  ParseNode *type_str = NULL;
+  ParseNode *type_node = NULL;
+  ParseNode *into_outfile = NULL;
+  make_name_node(type_str, result->malloc_pool_, "csv");
+  malloc_non_terminal_node(type_node, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT_TYPE, 1, type_str);
+  ParseNode *format_node = NULL;
+  malloc_non_terminal_node(format_node, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT, 1, type_node);
+  malloc_non_terminal_node(into_outfile, result->malloc_pool_,
+                           T_INTO_OUTFILE, 3, $6, format_node, NULL);
+  if (NULL != $$->children_[PARSE_SELECT_INTO]
+      || NULL != $$->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "COPY target conflicts with existing INTO clause");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = into_outfile;
+  }
+}
+;
 
 select_stmt:
 select_no_parens opt_when
