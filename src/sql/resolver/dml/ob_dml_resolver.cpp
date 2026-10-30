@@ -47,6 +47,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <ctime>
 #include <vector>
 #include <algorithm>
 #include <cctype>
@@ -601,10 +602,6 @@ static int jsonl_to_sql(const std::string &path_str, ObSqlString &select_sql)
 
 
 // ===== Parquet Reader (merged from ob_parquet_reader.cpp) =====
-#define PARQUET_DIAG(fmt, ...) do { \
-  FILE *fp = fopen("/tmp/parquet_diag.log", "a"); \
-  if (fp) { fprintf(fp, fmt "\n", ##__VA_ARGS__); fclose(fp); } \
-} while(0)
 
 // ========== Thrift Compact Protocol Reader ==========
 class ThriftReader {
@@ -855,6 +852,7 @@ public:
       if (!read_varint(header)) return false;
       if ((header & 1) == 0) {
         uint64_t run_len = header >> 1;
+        if (run_len == 0) return false;  // 防死循环
         int nbytes = (bw_ + 7) / 8;
         if (pos_ + nbytes > len_) return false;
         uint32_t v = 0;
@@ -862,6 +860,7 @@ public:
         for (uint64_t i = 0; i < run_len && (int64_t)out.size() < count; ++i) out.push_back(v);
       } else {
         uint64_t groups = header >> 1;
+        if (groups == 0) return false;  // 防死循环
         uint64_t num_vals = groups * 8;
         uint64_t nbytes = (num_vals * bw_ + 7) / 8;
         if (pos_ + (int64_t)nbytes > len_) return false;
@@ -1179,18 +1178,19 @@ static bool parse_page_header(ThriftReader &r, PageHeader &ph) {
 
 // ========== 类型转换 ==========
 static const char *phys_to_sql(int32_t type, int32_t converted_type) {
-  // converted_type: 0=UTF8 4=DATE 5=TIME_MILLIS 6=TIMESTAMP_MILLIS
-  if (converted_type == 0 || converted_type == 6) return "VARCHAR";
-  if (converted_type == 4) return "DATE";
-  if (converted_type == 6) return "DATETIME";
+  // Parquet ConvertedType: 0=UTF8 6=DATE 9=TIMESTAMP_MILLIS 10=TIMESTAMP_MICROS
+  // seekdb CAST 支持的类型: SIGNED/DOUBLE/DATE/DATETIME/CHAR
+  if (converted_type == 0) return "CHAR";                    // UTF8
+  if (converted_type == 6) return "DATE";                    // DATE
+  if (converted_type == 9 || converted_type == 10) return "DATETIME";  // TIMESTAMP
   switch (type) {
-    case 0: return "SIGNED";    // BOOLEAN → 用 SIGNED 表示
+    case 0: return "SIGNED";    // BOOLEAN → 用 SIGNED 表示 (bit-packed 解码后为 0/1)
     case 1: return "SIGNED";    // INT32
     case 2: return "SIGNED";    // INT64
     case 4: return "DOUBLE";    // FLOAT
     case 5: return "DOUBLE";    // DOUBLE
-    case 6: return "VARCHAR";   // BYTE_ARRAY
-    default: return "VARCHAR";
+    case 6: return "CHAR";      // BYTE_ARRAY
+    default: return "CHAR";
   }
 }
 
@@ -1217,11 +1217,8 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
 
   ParquetFileMeta fm;
   if (!parse_file_meta(data.data() + footer_start, footer_len, fm)) {
-    PARQUET_DIAG("footer parse failed");
     return -1;
   }
-  PARQUET_DIAG("footer ok: version=%d num_rows=%ld schema=%zu rgs=%zu",
-      fm.version, (long)fm.num_rows, fm.schema.size(), fm.row_groups.size());
 
   // 收集叶子列（schema[0] 是 root，其余是列）
   std::vector<int> leaf_idx;
@@ -1229,15 +1226,10 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
     if (fm.schema[i].num_children == 0) leaf_idx.push_back((int)i);
   }
   if (leaf_idx.empty()) return -1;
-  PARQUET_DIAG("leaf_idx=%zu", leaf_idx.size());
   for (size_t ri = 0; ri < fm.row_groups.size(); ++ri) {
     auto &rg = fm.row_groups[ri];
-    PARQUET_DIAG("RG%zu: num_rows=%ld cols=%zu", ri, (long)rg.num_rows, rg.columns.size());
     for (size_t ci = 0; ci < rg.columns.size(); ++ci) {
       auto &cm = rg.columns[ci];
-      PARQUET_DIAG("  Col%zu: type=%d codec=%d num_values=%ld data_off=%ld compressed=%ld",
-          ci, cm.type, cm.codec, (long)cm.num_values,
-          (long)cm.data_page_offset, (long)cm.compressed_size);
     }
   }
 
@@ -1261,24 +1253,17 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
       int max_def_level = (fm.schema[leaf_idx[ci]].repetition == 1) ? 1 : 0;
       int max_rep_level = (fm.schema[leaf_idx[ci]].repetition == 2) ? 1 : 0;
 
-      PARQUET_DIAG("Col%zu enter loop: remaining=%ld offset=%ld",
-          ci, (long)remaining_values, (long)offset);
       while (remaining_values > 0 && offset < footer_start) {
         // 读 PageHeader
         ThriftReader pr(data.data() + offset, footer_start - offset);
         PageHeader ph;
         if (!parse_page_header(pr, ph)) {
-          PARQUET_DIAG("page_header parse failed at offset=%ld", (long)offset);
           break;
         }
         int64_t hdr_size = pr.pos();
         int64_t data_start = offset + hdr_size;
         int64_t data_len = ph.compressed_size;
-        PARQUET_DIAG("page: type=%d unc=%d comp=%d hdr_size=%ld data_start=%ld",
-            ph.type, ph.uncompressed_size, ph.compressed_size,
-            (long)hdr_size, (long)data_start);
         if (data_len <= 0 || data_start + data_len > footer_start) {
-          PARQUET_DIAG("page data_len invalid");
           break;
         }
 
@@ -1297,13 +1282,9 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
           page_data.assign((const char*)raw, raw_len);
         }
 
-        // ===== FORCE_V2_HANDLE: 强制前置处理 DATA_PAGE_V2 =====
         if (ph.type == 3) {
           auto &dh = ph.data_header_v2;
           int64_t nvals = dh.num_values;
-          PARQUET_DIAG("FORCE_V2: nvals=%d enc=%d def_len=%d rep_len=%d compressed=%d page_data_size=%ld",
-              dh.num_values, dh.encoding, dh.definition_levels_byte_length,
-              dh.repetition_levels_byte_length, (int)dh.is_compressed, (long)page_data.size());
 
           // V2 page: page_data 是整个 page（levels + values），但 levels 不压缩
           const uint8_t *base = raw;
@@ -1322,7 +1303,6 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
             RleDecoder rle(base + rep_len, def_len, 1);
             std::vector<uint32_t> def_levels;
             if (!rle.decode_batch(nvals, def_levels)) {
-              PARQUET_DIAG("FORCE_V2: RLE decode def levels failed");
               offset = data_start + data_len;
               continue;
             }
@@ -1337,11 +1317,9 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
           std::string values_buf;
           if (dh.is_compressed && cm.codec == 1) {
             if (!snappy_decompress(vp_raw, vp_raw_len, values_buf)) {
-              PARQUET_DIAG("FORCE_V2: snappy failed (raw=%ld)", (long)vp_raw_len);
               offset = data_start + data_len;
               continue;
             }
-            PARQUET_DIAG("FORCE_V2: snappy ok, decompressed=%zu", values_buf.size());
           } else {
             values_buf.assign((const char*)vp_raw, vp_raw_len);
           }
@@ -1356,7 +1334,6 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
             int pt = fm.schema[leaf_idx[ci]].type;
             if (pt == 1) {
               if (vlen < non_null * 4) {
-                PARQUET_DIAG("FORCE_V2: INT32 vlen too small %ld < %ld", (long)vlen, (long)(non_null*4));
                 offset = data_start + data_len;
                 continue;
               }
@@ -1388,6 +1365,72 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
               }
             }
           }
+          // V2 后处理：BOOLEAN/DATE/DATETIME
+          if (non_null > 0 && !is_null.empty()) {
+            int pt2 = fm.schema[leaf_idx[ci]].type;
+            int32_t ct2 = fm.schema[leaf_idx[ci]].converted_type;
+            bool need_redecode = false;
+            if (pt2 == 0) need_redecode = true;  // V2 BOOLEAN 强制重解码（values 是 bit-packed）
+            if (pt2 == 1 && ct2 == 6 && dh.encoding == 0) need_redecode = true;
+            if (pt2 == 2 && (ct2 == 9 || ct2 == 10) && dh.encoding == 0) need_redecode = true;
+            if (need_redecode) {
+              strs.clear();
+              if (pt2 == 0) {
+                // V2 BOOLEAN RLE 4字节长度前缀 + RLE hybrid 数据
+                if (dh.encoding == 3 || dh.encoding == 4) {
+                  if (vlen >= 4) {
+                    uint32_t rle_len = (uint32_t)vp[0] | ((uint32_t)vp[1] << 8)
+                                     | ((uint32_t)vp[2] << 16) | ((uint32_t)vp[3] << 24);
+                    if (4 + (int64_t)rle_len <= vlen) {
+                      RleDecoder rle(vp + 4, rle_len, 1);
+                      std::vector<uint32_t> vals;
+                      if (rle.decode_batch(non_null, vals)) {
+                        for (size_t k = 0; k < vals.size() && (int64_t)k < non_null; ++k) {
+                          strs.push_back(vals[k] ? "1" : "0");
+                        }
+                      }
+                    }
+                  }
+                } else {
+                  // PLAIN: bit-packed LSB-first
+                  int64_t byte_cnt = (non_null + 7) / 8;
+                  if (vlen >= byte_cnt) {
+                    for (int64_t i = 0; i < non_null; ++i) {
+                      uint8_t b = vp[i / 8];
+                      strs.push_back(((b >> (i % 8)) & 1) ? "1" : "0");
+                    }
+                  }
+                }
+              } else if (pt2 == 1 && ct2 == 6) {
+                if (vlen >= non_null * 4) {
+                  for (int64_t i = 0; i < non_null; ++i) {
+                    int32_t days; memcpy(&days, vp + i * 4, 4);
+                    time_t t = (time_t)days * 86400;
+                    struct tm tmv; gmtime_r(&t, &tmv);
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+                        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+                    strs.push_back(buf);
+                  }
+                }
+              } else if (pt2 == 2 && (ct2 == 9 || ct2 == 10)) {
+                if (vlen >= non_null * 8) {
+                  for (int64_t i = 0; i < non_null; ++i) {
+                    int64_t us; memcpy(&us, vp + i * 8, 8);
+                    int64_t secs = us / 1000000;
+                    int64_t rem_us = us % 1000000;
+                    time_t t = (time_t)secs;
+                    struct tm tmv; gmtime_r(&t, &tmv);
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
+                        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                        tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (long)rem_us);
+                    strs.push_back(buf);
+                  }
+                }
+              }
+            }
+          }
           int64_t vi = 0;
           for (int64_t i = 0; i < nvals; ++i) {
             if (is_null[i]) cols[ci].push_back("");
@@ -1396,7 +1439,6 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
           }
           remaining_values -= nvals;
           offset = data_start + data_len;
-          PARQUET_DIAG("FORCE_V2: done, remaining=%ld", (long)remaining_values);
           continue;
         }
 
@@ -1437,29 +1479,68 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
           int64_t non_null = 0;
           for (int64_t i = 0; i < nvals; ++i) if (!is_null[i]) ++non_null;
 
+          int32_t ct = fm.schema[leaf_idx[ci]].converted_type;
           if (dh.encoding == 0) {  // PLAIN
             int pt = fm.schema[leaf_idx[ci]].type;
-            if (pt == 1) {  // INT32
+            if (pt == 0) {  // BOOLEAN: bit-packed, 8 values per byte
+              int64_t byte_cnt = (non_null + 7) / 8;
+              if (plen < byte_cnt) { offset = data_start + data_len; continue; }
+              for (int64_t i = 0; i < non_null; ++i) {
+                uint8_t b = p[i / 8];
+                strs.push_back(((b >> (i % 8)) & 1) ? "1" : "0");
+              }
+            } else if (pt == 1 && ct == 6) {  // DATE (days since epoch)
               if (plen < non_null * 4) { offset = data_start + data_len; continue; }
               for (int64_t i = 0; i < non_null; ++i) {
-                int32_t v;
-                memcpy(&v, p + i * 4, 4);
+                int32_t days; memcpy(&days, p + i * 4, 4);
+                time_t t = (time_t)days * 86400;
+                struct tm tmv;
+                gmtime_r(&t, &tmv);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+                    tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+                strs.push_back(buf);
+              }
+            } else if (pt == 1) {  // INT32
+              if (plen < non_null * 4) { offset = data_start + data_len; continue; }
+              for (int64_t i = 0; i < non_null; ++i) {
+                int32_t v; memcpy(&v, p + i * 4, 4);
                 strs.push_back(std::to_string(v));
+              }
+            } else if (pt == 2 && (ct == 9 || ct == 10)) {  // TIMESTAMP millis/micros
+              if (plen < non_null * 8) { offset = data_start + data_len; continue; }
+              int64_t div = (ct == 9) ? 1000 : 1;
+              for (int64_t i = 0; i < non_null; ++i) {
+                int64_t us; memcpy(&us, p + i * 8, 8);
+                int64_t secs = us / 1000000;
+                int64_t rem_us = us % 1000000;
+                time_t t = (time_t)secs;
+                struct tm tmv;
+                gmtime_r(&t, &tmv);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
+                    tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                    tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (long)rem_us);
+                strs.push_back(buf);
               }
             } else if (pt == 2) {  // INT64
               if (plen < non_null * 8) { offset = data_start + data_len; continue; }
               for (int64_t i = 0; i < non_null; ++i) {
-                int64_t v;
-                memcpy(&v, p + i * 8, 8);
+                int64_t v; memcpy(&v, p + i * 8, 8);
                 strs.push_back(std::to_string(v));
               }
-            } else if (pt == 4 || pt == 5) {  // FLOAT/DOUBLE
+            } else if (pt == 4) {  // FLOAT (4 bytes)
+              if (plen < non_null * 4) { offset = data_start + data_len; continue; }
+              for (int64_t i = 0; i < non_null; ++i) {
+                float v; memcpy(&v, p + i * 4, 4);
+                char buf[64]; snprintf(buf, sizeof(buf), "%g", (double)v);
+                strs.push_back(buf);
+              }
+            } else if (pt == 5) {  // DOUBLE (8 bytes)
               if (plen < non_null * 8) { offset = data_start + data_len; continue; }
               for (int64_t i = 0; i < non_null; ++i) {
-                double v;
-                memcpy(&v, p + i * 8, 8);
-                char buf[64];
-                snprintf(buf, sizeof(buf), "%g", v);
+                double v; memcpy(&v, p + i * 8, 8);
+                char buf[64]; snprintf(buf, sizeof(buf), "%g", v);
                 strs.push_back(buf);
               }
             } else if (pt == 6) {  // BYTE_ARRAY
@@ -1487,9 +1568,6 @@ static int do_read_parquet(const std::string &path, ObSqlString &sql) {
         } else if (ph.type == 3) {  // DATA_PAGE_V2
           auto &dh = ph.data_header_v2;
           int64_t nvals = dh.num_values;
-          PARQUET_DIAG("V2: nvals=%d enc=%d def_len=%d rep_len=%d compressed=%d",
-              dh.num_values, dh.encoding, dh.definition_levels_byte_length,
-              dh.repetition_levels_byte_length, (int)dh.is_compressed);
           // V2: levels 不压缩，直接用 raw；values 部分单独解压
           const uint8_t *p = raw;
           int64_t plen = raw_len;
