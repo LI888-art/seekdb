@@ -41,6 +41,17 @@
 #include "sql/resolver/dcl/ob_dcl_resolver.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
+#include <fstream>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cctype>
+#include "sql/resolver/ob_resolver_utils.h"
+#include <cstdlib>
+#include <cerrno>
+#include <cstdio>
+#include <sstream>
+#include <glob.h>
 
 namespace oceanbase
 {
@@ -51,6 +62,540 @@ using namespace pl;
 
 namespace sql
 {
+
+namespace {
+
+inline void read_csv_trim_str(std::string &s)
+{
+  auto not_space = [](unsigned char c) { return !std::isspace(c); };
+  s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+  s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+}
+
+int read_csv_header_line(const ObString &path, std::string &header_line, bool &empty_file)
+{
+  int ret = OB_SUCCESS;
+  empty_file = false;
+  std::string path_str(path.ptr(), path.length());
+  std::ifstream ifs(path_str.c_str(), std::ios::in | std::ios::binary);
+  if (!ifs.is_open()) {
+    ret = OB_FILE_NOT_EXIST;
+  } else if (!std::getline(ifs, header_line)) {
+    empty_file = true;
+  } else {
+    if (header_line.size() >= 3
+        && static_cast<unsigned char>(header_line[0]) == 0xEF
+        && static_cast<unsigned char>(header_line[1]) == 0xBB
+        && static_cast<unsigned char>(header_line[2]) == 0xBF) {
+      header_line.erase(0, 3);
+    }
+    if (!header_line.empty() && header_line.back() == '\r') {
+      header_line.pop_back();
+    }
+  }
+  return ret;
+}
+
+int split_csv_header(const std::string &header_line, std::vector<std::string> &columns)
+{
+  int ret = OB_SUCCESS;
+  columns.clear();
+  std::string cur;
+  for (char c : header_line) {
+    if (c == ',') {
+      read_csv_trim_str(cur);
+      if (cur.empty()) { ret = OB_INVALID_ARGUMENT; break; }
+      columns.push_back(cur);
+      cur.clear();
+    } else {
+      cur.push_back(c);
+    }
+  }
+  if (OB_SUCC(ret)) {
+    read_csv_trim_str(cur);
+    if (cur.empty()) { ret = OB_INVALID_ARGUMENT; }
+    else { columns.push_back(cur); }
+  }
+  if (OB_SUCC(ret)) {
+    std::vector<std::string> lowered;
+    for (auto &c : columns) {
+      std::string l = c;
+      std::transform(l.begin(), l.end(), l.begin(),
+                     [](unsigned char ch) { return std::tolower(ch); });
+      lowered.push_back(l);
+    }
+    std::sort(lowered.begin(), lowered.end());
+    if (std::adjacent_find(lowered.begin(), lowered.end()) != lowered.end()) {
+      ret = OB_ERR_COLUMN_DUPLICATE;
+    }
+  }
+  return ret;
+}
+
+inline void append_escaped_ident(ObSqlString &sql, const std::string &name)
+{
+  sql.append("`");
+  for (char c : name) {
+    if (c == '`') { sql.append("``"); } else { sql.append(&c, 1); }
+  }
+  sql.append("`");
+}
+
+static int glob_files_into_sql(const std::string &pattern, ObSqlString &select_sql)
+{
+  int ret = OB_SUCCESS;
+  glob_t g;
+  ::memset(&g, 0, sizeof(g));
+  int gret = ::glob(pattern.c_str(), 0, nullptr, &g);
+  if (GLOB_NOMATCH == gret) {
+    if (OB_FAIL(select_sql.append("select cast(null as char) as `file` where 1=0"))) {
+    }
+  } else if (0 != gret) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("glob failed", K(gret), K(pattern.c_str()));
+  } else {
+    bool first = true;
+    for (size_t i = 0; OB_SUCC(ret) && i < g.gl_pathc; ++i) {
+      const char *file_path = g.gl_pathv[i];
+      if (OB_ISNULL(file_path)) {
+        continue;
+      }
+      if (first) {
+        if (OB_FAIL(select_sql.append("select "))) break;
+        first = false;
+      } else {
+        if (OB_FAIL(select_sql.append(" union all select "))) break;
+      }
+      if (OB_FAIL(select_sql.append("'"))) break;
+      for (const char *p = file_path; *p; ++p) {
+        if (*p == '\'') {
+          if (OB_FAIL(select_sql.append("''"))) break;
+        } else {
+          if (OB_FAIL(select_sql.append(p, 1))) break;
+        }
+      }
+      if (OB_FAIL(select_sql.append("' as `file`"))) break;
+    }
+    if (OB_SUCC(ret) && first) {
+      if (OB_FAIL(select_sql.append("select cast(null as char) as `file` where 1=0"))) {
+      }
+    }
+  }
+  ::globfree(&g);
+  return ret;
+}
+
+// 解析一行扁平 JSON 对象：{"k1":v1,"k2":v2,...}
+// 返回值：true=成功，false=解析失败
+// nested_rejected: true 表示遇到嵌套 object/array
+static bool parse_json_object_line(const std::string &line,
+                                   std::vector<std::pair<std::string, std::string>> &out,
+                                   bool &nested_rejected)
+{
+  out.clear();
+  nested_rejected = false;
+  size_t pos = 0;
+  const size_t n = line.size();
+  auto skip_space = [&]() {
+    while (pos < n && std::isspace(static_cast<unsigned char>(line[pos]))) { ++pos; }
+  };
+  skip_space();
+  if (pos >= n) { return true; }  // 空行
+  if (line[pos] != '{') { return false; }
+  ++pos;
+  auto parse_string = [&](std::string &s) -> bool {
+    if (pos >= n || line[pos] != '"') { return false; }
+    ++pos;
+    s.clear();
+    while (pos < n) {
+      char c = line[pos];
+      if (c == '"') { ++pos; return true; }
+      if (c == '\\' && pos + 1 < n) {
+        char nx = line[pos + 1];
+        if (nx == '"') { s.push_back('"'); }
+        else if (nx == '\\') { s.push_back('\\'); }
+        else if (nx == '/') { s.push_back('/'); }
+        else if (nx == 'n') { s.push_back('\n'); }
+        else if (nx == 't') { s.push_back('\t'); }
+        else if (nx == 'r') { s.push_back('\r'); }
+        else { s.push_back('\\'); s.push_back(nx); }
+        pos += 2;
+      } else {
+        s.push_back(c);
+        ++pos;
+      }
+    }
+    return false;
+  };
+  while (pos < n) {
+    skip_space();
+    if (pos < n && line[pos] == '}') { return true; }
+    std::string key;
+    if (!parse_string(key)) { return false; }
+    skip_space();
+    if (pos >= n || line[pos] != ':') { return false; }
+    ++pos;
+    skip_space();
+    if (pos >= n) { return false; }
+    std::string value;
+    if (line[pos] == '"') {
+      if (!parse_string(value)) { return false; }
+    } else if (line[pos] == '{' || line[pos] == '[') {
+      nested_rejected = true;
+      return false;
+    } else if (line.compare(pos, 4, "true") == 0) {
+      value = "true"; pos += 4;
+    } else if (line.compare(pos, 5, "false") == 0) {
+      value = "false"; pos += 5;
+    } else if (line.compare(pos, 4, "null") == 0) {
+      value = ""; pos += 4;
+    } else {
+      size_t st = pos;
+      while (pos < n && (std::isdigit(static_cast<unsigned char>(line[pos]))
+                          || line[pos] == '-' || line[pos] == '+'
+                          || line[pos] == '.' || line[pos] == 'e' || line[pos] == 'E')) {
+        ++pos;
+      }
+      if (pos == st) { return false; }
+      value = line.substr(st, pos - st);
+    }
+    out.push_back(std::make_pair(key, value));
+    skip_space();
+    if (pos < n && line[pos] == ',') { ++pos; continue; }
+    if (pos < n && line[pos] == '}') { return true; }
+    return false;
+  }
+  return false;
+}
+
+
+
+// CSV 状态机解析：支持引号包裹字段、字段内逗号/换行、"" 转义、CRLF/LF
+// 返回 false 表示未闭合的引号（坏文件）
+static bool parse_csv_content(const std::string &content,
+                              std::vector<std::vector<std::string>> &rows)
+{
+  rows.clear();
+  std::vector<std::string> cur_row;
+  std::string cur_field;
+  bool in_quotes = false;
+  bool field_started = false;
+  bool row_has_content = false;
+  size_t i = 0;
+  const size_t n = content.size();
+  while (i < n) {
+    char c = content[i];
+    if (in_quotes) {
+      if (c == '"') {
+        if (i + 1 < n && content[i + 1] == '"') {
+          cur_field.push_back('"');
+          i += 2;
+        } else {
+          in_quotes = false;
+          i++;
+        }
+      } else {
+        cur_field.push_back(c);
+        i++;
+      }
+    } else {
+      if (c == '"' && cur_field.empty() && !field_started) {
+        in_quotes = true;
+        field_started = true;
+        row_has_content = true;
+        i++;
+      } else if (c == ',') {
+        cur_row.push_back(cur_field);
+        cur_field.clear();
+        field_started = false;
+        row_has_content = true;
+        i++;
+      } else if (c == '\r' || c == '\n') {
+        cur_row.push_back(cur_field);
+        cur_field.clear();
+        field_started = false;
+        rows.push_back(std::move(cur_row));
+        cur_row.clear();
+        row_has_content = false;
+        if (c == '\r' && i + 1 < n && content[i + 1] == '\n') {
+          i += 2;
+        } else {
+          i++;
+        }
+      } else {
+        cur_field.push_back(c);
+        field_started = true;
+        row_has_content = true;
+        i++;
+      }
+    }
+  }
+  if (in_quotes) {
+    return false;
+  }
+  if (row_has_content || !cur_field.empty()) {
+    cur_row.push_back(cur_field);
+  }
+  if (!cur_row.empty()) {
+    rows.push_back(std::move(cur_row));
+  }
+  return true;
+}
+
+
+static const int64_t FILE_SQL_MAX_CSV_COLUMNS = 1024;
+static const int64_t FILE_SQL_MAX_JSONL_LINES = 100000;
+
+enum class CsvInferredType {
+  UNKNOWN = 0,
+  BOOLEAN,
+  BIGINT,
+  DOUBLE,
+  DATE,
+  DATETIME,
+  VARCHAR,
+};
+
+static bool is_valid_date_ymd(int y, int m, int d)
+{
+  static const int days_in_month[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+  if (m < 1 || m > 12 || d < 1) return false;
+  int max_d = days_in_month[m];
+  if (2 == m && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) {
+    max_d = 29;
+  }
+  return d <= max_d;
+}
+
+inline CsvInferredType infer_csv_value_type(const std::string &raw)
+{
+  std::string s = raw;
+  read_csv_trim_str(s);
+  if (s.empty()) {
+    return CsvInferredType::UNKNOWN;
+  }
+  std::string lower = s;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  if (lower == "true" || lower == "false") {
+    return CsvInferredType::BOOLEAN;
+  }
+  {
+    char *end = nullptr;
+    errno = 0;
+    std::strtoll(s.c_str(), &end, 10);
+    if (errno == 0 && end == s.c_str() + s.size()) {
+      return CsvInferredType::BIGINT;
+    }
+  }
+  {
+    bool has_dot = s.find('.') != std::string::npos;
+    bool has_exp = s.find('e') != std::string::npos || s.find('E') != std::string::npos;
+    if (has_dot || has_exp) {
+      char *end = nullptr;
+      errno = 0;
+      std::strtod(s.c_str(), &end);
+      if (errno == 0 && end == s.c_str() + s.size()) {
+        return CsvInferredType::DOUBLE;
+      }
+    }
+  }
+  if (s.size() == 10 && s[4] == '-' && s[7] == '-') {
+    int y = 0, m = 0, d = 0;
+    if (sscanf(s.c_str(), "%d-%d-%d", &y, &m, &d) == 3
+        && y >= 1000 && y <= 9999 && is_valid_date_ymd(y, m, d)) {
+      return CsvInferredType::DATE;
+    }
+  }
+  if (s.size() == 19 && s[4] == '-' && s[7] == '-'
+      && (s[10] == ' ' || s[10] == 'T')
+      && s[13] == ':' && s[16] == ':') {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    const char *fmt = (s[10] == 'T') ? "%d-%d-%dT%d:%d:%d" : "%d-%d-%d %d:%d:%d";
+    if (sscanf(s.c_str(), fmt, &y, &mo, &d, &h, &mi, &se) == 6
+        && y >= 1000 && y <= 9999 && is_valid_date_ymd(y, mo, d)
+        && h >= 0 && h <= 23 && mi >= 0 && mi <= 59 && se >= 0 && se <= 59) {
+      return CsvInferredType::DATETIME;
+    }
+  }
+  return CsvInferredType::VARCHAR;
+}
+
+inline CsvInferredType merge_csv_type(CsvInferredType a, CsvInferredType b)
+{
+  if (a == CsvInferredType::UNKNOWN) return b;
+  if (b == CsvInferredType::UNKNOWN) return a;
+  if (a == b) return a;
+  if (a == CsvInferredType::VARCHAR || b == CsvInferredType::VARCHAR) {
+    return CsvInferredType::VARCHAR;
+  }
+  if ((a == CsvInferredType::BOOLEAN && b == CsvInferredType::BIGINT) ||
+      (a == CsvInferredType::BIGINT && b == CsvInferredType::BOOLEAN)) {
+    return CsvInferredType::VARCHAR;
+  }
+  if ((a == CsvInferredType::BOOLEAN && b == CsvInferredType::DOUBLE) ||
+      (a == CsvInferredType::DOUBLE && b == CsvInferredType::BOOLEAN)) {
+    return CsvInferredType::VARCHAR;
+  }
+  if ((a == CsvInferredType::BOOLEAN && b == CsvInferredType::BIGINT) ||
+      (a == CsvInferredType::BIGINT && b == CsvInferredType::BOOLEAN)) {
+    return CsvInferredType::BIGINT;
+  }
+  if ((a == CsvInferredType::BIGINT && b == CsvInferredType::DOUBLE) ||
+      (a == CsvInferredType::DOUBLE && b == CsvInferredType::BIGINT)) {
+    return CsvInferredType::DOUBLE;
+  }
+  if ((a == CsvInferredType::DATE && b == CsvInferredType::DATETIME) ||
+      (a == CsvInferredType::DATETIME && b == CsvInferredType::DATE)) {
+    return CsvInferredType::DATETIME;
+  }
+  return CsvInferredType::VARCHAR;
+}
+
+inline const char *csv_type_to_sql(CsvInferredType t)
+{
+  switch (t) {
+    case CsvInferredType::BOOLEAN:  return "SIGNED";
+    case CsvInferredType::BIGINT:   return "SIGNED";
+    case CsvInferredType::DOUBLE:   return "DOUBLE";
+    case CsvInferredType::DATE:     return "DATE";
+    case CsvInferredType::DATETIME: return "DATETIME";
+    default:                        return "CHAR";
+  }
+}
+
+
+// 读 JSONL 文件，拼成 union all SQL
+static int jsonl_to_sql(const std::string &path_str, ObSqlString &select_sql)
+{
+  int ret = OB_SUCCESS;
+  std::ifstream ifs(path_str.c_str(), std::ios::in | std::ios::binary);
+  if (!ifs.is_open()) {
+    return OB_FILE_NOT_EXIST;
+  }
+  std::vector<std::vector<std::pair<std::string, std::string>>> rows;
+  std::string line;
+  int64_t line_no = 0;
+  while (std::getline(ifs, line)) {
+    ++line_no;
+    if (line_no > FILE_SQL_MAX_JSONL_LINES) {
+      char err_msg[256];
+      snprintf(err_msg, sizeof(err_msg),
+          "read_json: line count exceeds limit %ld",
+          FILE_SQL_MAX_JSONL_LINES);
+      LOG_USER_ERROR(OB_SIZE_OVERFLOW, err_msg);
+      return OB_SIZE_OVERFLOW;
+    }
+    if (!line.empty() && line.back() == '\r') { line.pop_back(); }
+    std::vector<std::pair<std::string, std::string>> fields;
+    bool nested = false;
+    if (!parse_json_object_line(line, fields, nested)) {
+      if (nested) {
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg),
+            "read_json: nested object/array at line %ld", line_no);
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, err_msg);
+        return OB_NOT_SUPPORTED;
+      } else {
+        int32_t snippet_len = static_cast<int32_t>(
+            line.size() < 60 ? line.size() : 60);
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg),
+            "read_json: invalid JSON object at line %ld: %.*s",
+            line_no, snippet_len, line.c_str());
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, err_msg);
+        return OB_INVALID_ARGUMENT;
+      }
+    }
+    if (!fields.empty()) { rows.push_back(std::move(fields)); }
+  }
+  if (rows.empty()) {
+    return OB_INVALID_ARGUMENT;
+  }
+  // 字段并集（首次出现顺序）
+  std::vector<std::string> columns;
+  for (auto &row : rows) {
+    for (auto &kv : row) {
+      bool found = false;
+      for (auto &c : columns) { if (c == kv.first) { found = true; break; } }
+      if (!found) { columns.push_back(kv.first); }
+    }
+  }
+  if (columns.empty()) {
+    return OB_INVALID_ARGUMENT;
+  }
+  auto col_idx = [&](const std::string &k) -> int64_t {
+    for (size_t i = 0; i < columns.size(); ++i) {
+      if (columns[i] == k) { return static_cast<int64_t>(i); }
+    }
+    return -1;
+  };
+  // 类型推断
+  std::vector<CsvInferredType> col_types(columns.size(), CsvInferredType::UNKNOWN);
+  for (auto &row : rows) {
+    std::vector<std::string> values(columns.size());
+    for (auto &kv : row) {
+      int64_t idx = col_idx(kv.first);
+      if (idx >= 0) { values[idx] = kv.second; }
+    }
+    for (size_t i = 0; i < values.size(); ++i) {
+      col_types[i] = merge_csv_type(col_types[i], infer_csv_value_type(values[i]));
+    }
+  }
+  for (size_t i = 0; i < col_types.size(); ++i) {
+    if (col_types[i] == CsvInferredType::UNKNOWN) { col_types[i] = CsvInferredType::VARCHAR; }
+  }
+  // 拼 SQL
+  for (size_t r = 0; OB_SUCC(ret) && r < rows.size(); ++r) {
+    if (r == 0) {
+      if (OB_FAIL(select_sql.append("select "))) break;
+    } else {
+      if (OB_FAIL(select_sql.append(" union all select "))) break;
+    }
+    std::vector<std::string> values(columns.size());
+    for (auto &kv : rows[r]) {
+      int64_t idx = col_idx(kv.first);
+      if (idx >= 0) { values[idx] = kv.second; }
+    }
+    for (size_t i = 0; OB_SUCC(ret) && i < columns.size(); ++i) {
+      if (i > 0 && OB_FAIL(select_sql.append(", "))) break;
+      if (values[i].empty()) {
+        if (OB_FAIL(select_sql.append("cast(NULL as "))) break;
+        if (OB_FAIL(select_sql.append(csv_type_to_sql(col_types[i])))) break;
+        if (OB_FAIL(select_sql.append(")"))) break;
+      } else if (col_types[i] == CsvInferredType::BOOLEAN) {
+        std::string bv = values[i];
+        read_csv_trim_str(bv);
+        std::string bl = bv;
+        std::transform(bl.begin(), bl.end(), bl.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (OB_FAIL(select_sql.append("cast("))) break;
+        if (OB_FAIL(select_sql.append(bl == "true" ? "1" : "0"))) break;
+        if (OB_FAIL(select_sql.append(" as SIGNED)"))) break;
+      } else {
+          if (OB_FAIL(select_sql.append("cast('"))) break;
+          for (char c : values[i]) {
+            if (c == '\'') {
+              if (OB_FAIL(select_sql.append("''"))) break;
+            } else {
+              if (OB_FAIL(select_sql.append(&c, 1))) break;
+            }
+          }
+          if (OB_FAIL(select_sql.append("' as "))) break;
+          if (OB_FAIL(select_sql.append(csv_type_to_sql(col_types[i])))) break;
+          if (OB_FAIL(select_sql.append(")"))) break;
+      }
+      if (OB_FAIL(select_sql.append(" as "))) break;
+      append_escaped_ident(select_sql, columns[i]);
+    }
+  }
+  return ret;
+}
+
+
+
+}  // anonymous namespace
+
 ObDMLResolver::ObDMLResolver(ObResolverParams &params)
     : ObStmtResolver(params),
       current_scope_(T_NONE_SCOPE),
@@ -2702,7 +3247,11 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         break;
       }
       case T_JSON_TABLE_EXPRESSION: {
-        OZ (resolve_json_table_item(*table_node, table_item));
+        if (table_node->num_child_ == 3 || table_node->num_child_ == 4) {
+          OZ (resolve_read_csv_item(*table_node, table_item));
+        } else {
+          OZ (resolve_json_table_item(*table_node, table_item));
+        }
         break;
       }
       case T_UNNEST_EXPRESSION: {
@@ -12823,5 +13372,500 @@ int ObDMLResolver::check_need_fill_embedded_vec_expr_param(const ObDMLStmt &stmt
   return ret;
 }
 
+int ObDMLResolver::resolve_read_csv_item(const ParseNode &table_node, TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *stmt = get_stmt();
+  ParseNode *func_name_node = nullptr;
+  ParseNode *path_node = nullptr;
+  ParseNode *alias_node = nullptr;
+
+  ParseNode *param_list_node = nullptr;
+  if (OB_ISNULL(stmt) || OB_ISNULL(session_info_) || OB_ISNULL(allocator_)
+      || OB_ISNULL(params_.expr_factory_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_JSON_TABLE_EXPRESSION != table_node.type_
+             || (3 != table_node.num_child_ && 4 != table_node.num_child_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("read_csv expression param mismatch", K(ret), K(table_node.num_child_));
+  } else {
+    func_name_node = table_node.children_[0];
+    path_node = table_node.children_[1];
+    if (3 == table_node.num_child_) {
+      alias_node = table_node.children_[2];
+    } else {
+      param_list_node = table_node.children_[2];
+      alias_node = table_node.children_[3];
+    }
+  }
+
+  bool header_param = true;
+  int64_t sample_size_param = -1;
+  ObString format_param;
+  if (OB_SUCC(ret) && OB_NOT_NULL(param_list_node)) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < param_list_node->num_child_; ++i) {
+      ParseNode *param_node = param_list_node->children_[i];
+      if (OB_ISNULL(param_node)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("read_csv param null", K(ret));
+      } else if (T_OP_EQ != param_node->type_ || 2 != param_node->num_child_
+                 || OB_ISNULL(param_node->children_[0])
+                 || OB_ISNULL(param_node->children_[1])) {
+        ret = OB_ERR_PARSE_SQL;
+        LOG_WARN("read_csv only accepts named parameter", K(ret));
+      } else {
+        ParseNode *name_node = param_node->children_[0];
+        ParseNode *value_node = param_node->children_[1];
+        const char *name_ptr = nullptr;
+        int32_t name_len = 0;
+        if (T_COLUMN_REF == name_node->type_ && 3 == name_node->num_child_
+            && OB_NOT_NULL(name_node->children_[2])) {
+          name_ptr = name_node->children_[2]->str_value_;
+          name_len = name_node->children_[2]->str_len_;
+        } else if (T_IDENT == name_node->type_) {
+          name_ptr = name_node->str_value_;
+          name_len = name_node->str_len_;
+        }
+        if (OB_ISNULL(name_ptr) || 0 == name_len) {
+          ret = OB_ERR_PARSE_SQL;
+          LOG_WARN("read_csv named param name invalid", K(ret));
+        } else {
+          ObString param_name(name_len, name_ptr);
+          if (0 == param_name.case_compare("header")) {
+            if (T_BOOL == value_node->type_ || T_INT == value_node->type_) {
+              header_param = (0 != value_node->value_);
+            } else {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("read_csv header param invalid", K(ret));
+            }
+          } else if (0 == param_name.case_compare("sample_size")) {
+            if (T_INT == value_node->type_ || T_UINT64 == value_node->type_) {
+              sample_size_param = static_cast<int64_t>(value_node->value_);
+            } else if (T_OP_NEG == value_node->type_ && 1 == value_node->num_child_
+                       && OB_NOT_NULL(value_node->children_[0])
+                       && (T_INT == value_node->children_[0]->type_
+                           || T_UINT64 == value_node->children_[0]->type_)) {
+              sample_size_param = -static_cast<int64_t>(value_node->children_[0]->value_);
+            } else {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("read_csv sample_size param invalid", K(ret));
+            }
+          } else if (0 == param_name.case_compare("format")) {
+            if (T_VARCHAR == value_node->type_ || T_CHAR == value_node->type_) {
+              format_param.assign_ptr(value_node->str_value_, value_node->str_len_);
+            } else {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("read_csv format param invalid", K(ret));
+            }
+          } else {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv unknown named parameter");
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && sample_size_param != -1) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv sample_size other than -1");
+    }
+    if (OB_SUCC(ret) && !header_param) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv header = false");
+    }
+  }
+
+  bool is_glob = false;
+  bool is_json = false;
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(func_name_node) || OB_ISNULL(func_name_node->str_value_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (0 == strcasecmp(func_name_node->str_value_, "glob")) {
+      is_glob = true;
+    } else if (0 == strcasecmp(func_name_node->str_value_, "read_json")
+               || 0 == strcasecmp(func_name_node->str_value_, "read_ndjson")) {
+      is_json = true;
+    } else if (0 != strcasecmp(func_name_node->str_value_, "read_csv")) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "only read_csv/glob is supported for file table function");
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (is_json) {
+      if (!format_param.empty() && 0 != format_param.case_compare("newline_delimited")) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_json format only supports newline_delimited");
+      }
+    } else if (!format_param.empty()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "format parameter only valid for read_json");
+    }
+  }
+
+  if (OB_SUCC(ret) && is_glob) {
+    ObString glob_path;
+    if (OB_ISNULL(path_node) || OB_ISNULL(path_node->str_value_) || 0 == path_node->str_len_) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "glob file pattern");
+    } else if (OB_FAIL(ob_write_string(*allocator_,
+                                       ObString(path_node->str_len_, path_node->str_value_),
+                                       glob_path))) {
+      LOG_WARN("failed to copy glob path", K(ret));
+    } else {
+      ObSqlString glob_sql;
+      if (OB_FAIL(glob_files_into_sql(std::string(glob_path.ptr(), glob_path.length()),
+                                       glob_sql))) {
+        LOG_WARN("failed to glob files", K(ret));
+      } else {
+        ObString sql_str(glob_sql.length(), glob_sql.ptr());
+        ParseResult parse_result;
+        ObParser parser(*allocator_, session_info_->get_sql_mode(),
+                        session_info_->get_charsets4parser());
+        if (OB_FAIL(parser.parse(sql_str, parse_result))) {
+          LOG_WARN("failed to parse glob sql", K(ret), K(sql_str));
+        } else if (OB_ISNULL(parse_result.result_tree_)
+                   || OB_ISNULL(parse_result.result_tree_->children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ObSelectResolver select_resolver(params_);
+          select_resolver.set_current_level(current_level_);
+          select_resolver.set_current_view_level(current_view_level_);
+          select_resolver.set_parent_namespace_resolver(parent_namespace_resolver_);
+          ParseNode *select_node = parse_result.result_tree_->children_[0];
+          if (OB_FAIL(select_resolver.resolve_child_stmt(*select_node))) {
+            LOG_WARN("failed to resolve glob subquery", K(ret));
+          } else {
+            ObSelectStmt *ref_stmt = select_resolver.get_child_stmt();
+            ObString alias_name;
+            if (OB_ISNULL(alias_node) || OB_ISNULL(alias_node->str_value_)) {
+              ret = OB_ERR_TABLE_WITHOUT_ALIAS;
+              LOG_USER_ERROR(OB_ERR_TABLE_WITHOUT_ALIAS);
+            } else if (OB_ISNULL(table_item = stmt->create_table_item(*allocator_))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              alias_name.assign_ptr(alias_node->str_value_, alias_node->str_len_);
+              if (alias_name.empty()) {
+                alias_name = ObString::make_string("__file_sql_auto__");
+              }
+              table_item->table_name_ = alias_name;
+              table_item->alias_name_ = alias_name;
+              table_item->table_id_ = generate_table_id();
+              table_item->type_ = TableItem::GENERATED_TABLE;
+              table_item->is_view_table_ = false;
+              table_item->ref_query_ = ref_stmt;
+              if (OB_FAIL(stmt->add_table_item(session_info_, table_item))) {
+                LOG_WARN("failed to add glob table item", K(ret));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && is_glob) {
+    return ret;
+  }
+
+  if (OB_SUCC(ret) && is_json) {
+    ObString json_path;
+    if (OB_ISNULL(path_node) || OB_ISNULL(path_node->str_value_) || 0 == path_node->str_len_) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_json file path");
+    } else if (OB_FAIL(ob_write_string(*allocator_,
+                                       ObString(path_node->str_len_, path_node->str_value_),
+                                       json_path))) {
+      LOG_WARN("failed to copy json path", K(ret));
+    } else {
+      ObSqlString json_sql;
+      if (OB_FAIL(jsonl_to_sql(std::string(json_path.ptr(), json_path.length()),
+                                json_sql))) {
+        LOG_WARN("failed to parse jsonl", K(ret));
+      } else {
+        ObString sql_str(json_sql.length(), json_sql.ptr());
+        ParseResult parse_result;
+        ObParser parser(*allocator_, session_info_->get_sql_mode(),
+                        session_info_->get_charsets4parser());
+        if (OB_FAIL(parser.parse(sql_str, parse_result))) {
+          LOG_WARN("failed to parse json sql", K(ret), K(sql_str));
+        } else if (OB_ISNULL(parse_result.result_tree_)
+                   || OB_ISNULL(parse_result.result_tree_->children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ObSelectResolver select_resolver(params_);
+          select_resolver.set_current_level(current_level_);
+          select_resolver.set_current_view_level(current_view_level_);
+          select_resolver.set_parent_namespace_resolver(parent_namespace_resolver_);
+          ParseNode *select_node = parse_result.result_tree_->children_[0];
+          if (OB_FAIL(select_resolver.resolve_child_stmt(*select_node))) {
+            LOG_WARN("failed to resolve json subquery", K(ret));
+          } else {
+            ObSelectStmt *ref_stmt = select_resolver.get_child_stmt();
+            ObString alias_name;
+            if (OB_ISNULL(alias_node) || OB_ISNULL(alias_node->str_value_)) {
+              ret = OB_ERR_TABLE_WITHOUT_ALIAS;
+              LOG_USER_ERROR(OB_ERR_TABLE_WITHOUT_ALIAS);
+            } else if (OB_ISNULL(table_item = stmt->create_table_item(*allocator_))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              alias_name.assign_ptr(alias_node->str_value_, alias_node->str_len_);
+              if (alias_name.empty()) {
+                alias_name = ObString::make_string("__file_sql_auto__");
+              }
+              table_item->table_name_ = alias_name;
+              table_item->alias_name_ = alias_name;
+              table_item->table_id_ = generate_table_id();
+              table_item->type_ = TableItem::GENERATED_TABLE;
+              table_item->is_view_table_ = false;
+              table_item->ref_query_ = ref_stmt;
+              if (OB_FAIL(stmt->add_table_item(session_info_, table_item))) {
+                LOG_WARN("failed to add json table item", K(ret));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && is_json) {
+    return ret;
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(func_name_node) || OB_ISNULL(func_name_node->str_value_)
+        || 0 != strcasecmp(func_name_node->str_value_, "read_csv")) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "only read_csv is supported for file table function");
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    bool enable_file_sql = false;
+    if (OB_FAIL(session_info_->get_enable_file_sql(enable_file_sql))) {
+      LOG_WARN("failed to get enable_file_sql", K(ret));
+    } else if (!enable_file_sql) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv is disabled, set enable_file_sql = ON first");
+    }
+  }
+
+  ObString path_str;
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(path_node) || OB_ISNULL(path_node->str_value_) || 0 == path_node->str_len_) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv file path");
+    } else if (OB_FAIL(ob_write_string(*allocator_,
+                                       ObString(path_node->str_len_, path_node->str_value_),
+                                       path_str))) {
+      LOG_WARN("failed to copy csv path", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    ObString secure_file_priv;
+    if (OB_FAIL(session_info_->get_secure_file_priv(secure_file_priv))) {
+      LOG_WARN("failed to get secure_file_priv", K(ret));
+    } else if (!session_info_->is_inner()
+               && OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, path_str))) {
+      LOG_WARN("read_csv path rejected by secure_file_priv", K(ret), K(path_str));
+    }
+  }
+
+  // 5. 读整个文件 + CSV 状态机解析（支持引号、字段内换行、转义引号）
+  std::vector<std::string> columns;
+  std::vector<std::vector<std::string>> data_rows;
+  const int64_t MAX_PREVIEW_ROWS = 1000;
+  std::vector<CsvInferredType> col_types;
+  if (OB_SUCC(ret)) {
+    std::string path_std(path_str.ptr(), path_str.length());
+    std::ifstream ifs(path_std.c_str(), std::ios::in | std::ios::binary);
+    if (!ifs.is_open()) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_USER_ERROR(OB_FILE_NOT_EXIST, path_str.length(), path_str.ptr());
+    } else {
+      std::stringstream ss;
+      ss << ifs.rdbuf();
+      std::string csv_content = ss.str();
+      if (csv_content.size() >= 3
+          && static_cast<unsigned char>(csv_content[0]) == 0xEF
+          && static_cast<unsigned char>(csv_content[1]) == 0xBB
+          && static_cast<unsigned char>(csv_content[2]) == 0xBF) {
+        csv_content.erase(0, 3);
+      }
+      std::vector<std::vector<std::string>> all_rows;
+      if (!parse_csv_content(csv_content, all_rows)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv: unterminated quote");
+      } else if (all_rows.empty() || all_rows[0].empty()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv on empty file");
+      } else {
+        columns = all_rows[0];
+        if (static_cast<int64_t>(columns.size()) > FILE_SQL_MAX_CSV_COLUMNS) {
+          ret = OB_SIZE_OVERFLOW;
+          char err_msg[256];
+          snprintf(err_msg, sizeof(err_msg),
+              "read_csv: column count %ld exceeds limit %ld",
+              static_cast<int64_t>(columns.size()), FILE_SQL_MAX_CSV_COLUMNS);
+          LOG_USER_ERROR(OB_SIZE_OVERFLOW, err_msg);
+        }
+        std::vector<std::string> seen_lower;
+        for (size_t i = 0; OB_SUCC(ret) && i < columns.size(); ++i) {
+          read_csv_trim_str(columns[i]);
+          if (columns[i].empty()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv header empty column");
+            break;
+          }
+          std::string base = columns[i];
+          std::string name = base;
+          int suffix = 2;
+          while (true) {
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            bool dup = false;
+            for (const auto &s : seen_lower) {
+              if (s == lower) { dup = true; break; }
+            }
+            if (!dup) break;
+            name = base + "__" + std::to_string(suffix++);
+          }
+          columns[i] = name;
+          std::string lower = name;
+          std::transform(lower.begin(), lower.end(), lower.begin(),
+                         [](unsigned char c) { return std::tolower(c); });
+          seen_lower.push_back(lower);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        col_types.assign(columns.size(), CsvInferredType::UNKNOWN);
+        for (size_t i = 1; i < all_rows.size()
+             && static_cast<int64_t>(data_rows.size()) < MAX_PREVIEW_ROWS; ++i) {
+          if (all_rows[i].size() != columns.size()) {
+            LOG_WARN("read_csv: column count mismatch, skip bad row",
+                     K(all_rows[i].size()), K(columns.size()));
+            continue;
+          }
+          for (size_t j = 0; j < all_rows[i].size(); ++j) {
+            CsvInferredType t = infer_csv_value_type(all_rows[i][j]);
+            col_types[j] = merge_csv_type(col_types[j], t);
+          }
+          data_rows.push_back(std::move(all_rows[i]));
+        }
+      }
+    }
+  }
+
+  for (size_t i = 0; i < col_types.size(); ++i) {
+    if (col_types[i] == CsvInferredType::UNKNOWN) {
+      col_types[i] = CsvInferredType::VARCHAR;
+    }
+  }
+
+  ObSqlString select_sql;
+  if (OB_SUCC(ret)) {
+    if (data_rows.empty()) {
+      if (OB_FAIL(select_sql.append("select "))) {
+      } else {
+        for (size_t i = 0; OB_SUCC(ret) && i < columns.size(); ++i) {
+          if (i > 0 && OB_FAIL(select_sql.append(", "))) break;
+          if (OB_FAIL(select_sql.append("cast(null as "))) break;
+          if (OB_FAIL(select_sql.append(csv_type_to_sql(col_types[i])))) break;
+          if (OB_FAIL(select_sql.append(") as "))) break;
+          append_escaped_ident(select_sql, columns[i]);
+        }
+        if (OB_SUCC(ret) && OB_FAIL(select_sql.append(" where 1=0"))) {
+        }
+      }
+    } else {
+      for (size_t r = 0; OB_SUCC(ret) && r < data_rows.size(); ++r) {
+        if (r == 0) {
+          if (OB_FAIL(select_sql.append("select "))) break;
+        } else {
+          if (OB_FAIL(select_sql.append(" union all select "))) break;
+        }
+        for (size_t i = 0; OB_SUCC(ret) && i < data_rows[r].size(); ++i) {
+          if (i > 0 && OB_FAIL(select_sql.append(", "))) break;
+          if (data_rows[r][i].empty()) {
+            if (OB_FAIL(select_sql.append("cast(NULL as "))) break;
+            if (OB_FAIL(select_sql.append(csv_type_to_sql(col_types[i])))) break;
+            if (OB_FAIL(select_sql.append(")"))) break;
+          } else if (col_types[i] == CsvInferredType::BOOLEAN) {
+            std::string bv = data_rows[r][i];
+            read_csv_trim_str(bv);
+            std::string bl = bv;
+            std::transform(bl.begin(), bl.end(), bl.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (OB_FAIL(select_sql.append("cast("))) break;
+            if (OB_FAIL(select_sql.append(bl == "true" ? "1" : "0"))) break;
+            if (OB_FAIL(select_sql.append(" as SIGNED)"))) break;
+          } else {
+              if (OB_FAIL(select_sql.append("cast('"))) break;
+              for (char c : data_rows[r][i]) {
+                if (c == '\'') {
+                  if (OB_FAIL(select_sql.append("''"))) break;
+                } else {
+                  if (OB_FAIL(select_sql.append(&c, 1))) break;
+                }
+              }
+              if (OB_FAIL(select_sql.append("' as "))) break;
+              if (OB_FAIL(select_sql.append(csv_type_to_sql(col_types[i])))) break;
+              if (OB_FAIL(select_sql.append(")"))) break;
+          }
+          if (OB_FAIL(select_sql.append(" as "))) break;
+          append_escaped_ident(select_sql, columns[i]);
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    ObString sql_str(select_sql.length(), select_sql.ptr());
+    ParseResult parse_result;
+    ObParser parser(*allocator_, session_info_->get_sql_mode(), session_info_->get_charsets4parser());
+    if (OB_FAIL(parser.parse(sql_str, parse_result))) {
+      LOG_WARN("failed to parse generated read_csv sql", K(ret), K(sql_str));
+    } else if (OB_ISNULL(parse_result.result_tree_)
+               || OB_ISNULL(parse_result.result_tree_->children_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ObSelectResolver select_resolver(params_);
+      select_resolver.set_current_level(current_level_);
+      select_resolver.set_current_view_level(current_view_level_);
+      select_resolver.set_parent_namespace_resolver(parent_namespace_resolver_);
+      ParseNode *select_node = parse_result.result_tree_->children_[0];
+      if (OB_FAIL(select_resolver.resolve_child_stmt(*select_node))) {
+        LOG_WARN("failed to resolve generated read_csv subquery", K(ret));
+      } else {
+        ObSelectStmt *ref_stmt = select_resolver.get_child_stmt();
+        ObString alias_name;
+        if (OB_ISNULL(alias_node) || OB_ISNULL(alias_node->str_value_)) {
+          ret = OB_ERR_TABLE_WITHOUT_ALIAS;
+          LOG_USER_ERROR(OB_ERR_TABLE_WITHOUT_ALIAS);
+        } else if (OB_ISNULL(table_item = stmt->create_table_item(*allocator_))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          alias_name.assign_ptr(alias_node->str_value_, alias_node->str_len_);
+          if (alias_name.empty()) {
+            alias_name = ObString::make_string("__file_sql_auto__");
+          }
+          table_item->table_name_ = alias_name;
+          table_item->alias_name_ = alias_name;
+          table_item->table_id_ = generate_table_id();
+          table_item->type_ = TableItem::GENERATED_TABLE;
+          table_item->is_view_table_ = false;
+          table_item->ref_query_ = ref_stmt;
+          if (OB_FAIL(stmt->add_table_item(session_info_, table_item))) {
+            LOG_WARN("failed to add read_csv table item", K(ret));
+          }
+        }
+      }
+    }
+  }
+
+  return ret;
+}
 }  // namespace sql
 }  // namespace oceanbase

@@ -40,7 +40,7 @@ public:
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
         hub_(hub),
-        segmenters_(allocator_),
+        segmenters_(),
         cache_main_(allocator),
         cache_quan_(allocator),
         cache_stop_(allocator),

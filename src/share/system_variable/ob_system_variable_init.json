@@ -2459,6 +2459,19 @@
     "background_cn": "导入导出功能未限制文件访问可能存在漏洞",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Enable file SQL (read_csv/read_json/read_parquet)",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "publish_version": "",
+    "info_cn": "是否开启文件即数据库功能",
+    "background_cn": "赛题二：文件即数据库，默认关闭",
+    "ref_url": ""
+  },
   "_enable_parallel_query": {
     "id": 10104,
     "name": "_enable_parallel_query",

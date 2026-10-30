@@ -17,6 +17,9 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_explain_resolver.h"
 #include "sql/resolver/ob_resolver.h"
+#include <cstring>
+#include <strings.h>
+#include "sql/resolver/dml/ob_select_resolver.h"
 
 using namespace oceanbase;
 using namespace sql;
@@ -26,9 +29,143 @@ const static int64_t EXPLAIN_DISPLAY_OPTION = 1;
 const static int64_t EXPLAIN_INTO_TABLE = 2;
 const static int64_t EXPLAIN_STMT_ID = 3;
 const static int64_t EXPLAIN_CHILD_STMT = 4;
+
+namespace {
+
+static bool file_sql_is_read_func(const ParseNode *node)
+{
+  if (OB_ISNULL(node) || OB_ISNULL(node->str_value_) || 0 == node->str_len_) {
+    return false;
+  }
+  ObString name(node->str_len_, node->str_value_);
+  return 0 == name.case_compare("read_csv")
+      || 0 == name.case_compare("read_json")
+      || 0 == name.case_compare("read_ndjson")
+      || 0 == name.case_compare("read_parquet");
+}
+
+static bool file_sql_contains_read_expr(const ParseNode *node)
+{
+  if (OB_ISNULL(node)) return false;
+  if (T_JSON_TABLE_EXPRESSION == node->type_ && node->num_child_ >= 1) {
+    if (file_sql_is_read_func(node->children_[0])) return true;
+  }
+  for (int64_t i = 0; i < node->num_child_; ++i) {
+    if (file_sql_contains_read_expr(node->children_[i])) return true;
+  }
+  return false;
+}
+
+static const char *file_sql_normalize_type_name(ObObjType type)
+{
+  const char *raw = ob_obj_type_str(type);
+  if (OB_ISNULL(raw)) return "VARCHAR";
+  if (0 == strncasecmp(raw, "MYSQL_", 6)) {
+    raw += 6;
+  }
+  return raw;
+}
+
+static int file_sql_build_describe_meta_stmt(
+    ObResolverParams &params,
+    ObSelectStmt &child_stmt,
+    ObSelectStmt *&meta_stmt)
+{
+  int ret = OB_SUCCESS;
+  meta_stmt = nullptr;
+
+  ObIArray<TableItem*> &items = child_stmt.get_table_items();
+  TableItem *file_item = nullptr;
+  for (int64_t i = 0; OB_ISNULL(file_item) && i < items.count(); ++i) {
+    TableItem *it = items.at(i);
+    if (OB_NOT_NULL(it) && TableItem::GENERATED_TABLE == it->type_
+        && OB_NOT_NULL(it->ref_query_)) {
+      file_item = it;
+    }
+  }
+  if (OB_ISNULL(file_item)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ObIArray<SelectItem> &sel_items = file_item->ref_query_->get_select_items();
+    if (sel_items.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ObSqlString sql;
+      for (int64_t i = 0; OB_SUCC(ret) && i < sel_items.count(); ++i) {
+        const SelectItem &si = sel_items.at(i);
+        ObString col_name = si.alias_name_;
+        if (col_name.empty()) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          const char *type_str = "VARCHAR";
+          if (OB_NOT_NULL(si.expr_)) {
+            type_str = file_sql_normalize_type_name(si.expr_->get_result_type().get_type());
+          }
+          if (i > 0 && OB_FAIL(sql.append(" UNION ALL "))) {
+          } else if (OB_FAIL(sql.append_fmt(
+              "SELECT '%.*s' AS column_name, '%s' AS column_type, "
+              "'YES' AS `null`, NULL AS `key`, NULL AS `default`, NULL AS `extra`",
+              col_name.length(), col_name.ptr(), type_str))) {
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ObParser parser(*params.allocator_, params.session_info_->get_sql_mode(),
+                        params.session_info_->get_charsets4parser());
+        ParseResult pr;
+        if (OB_FAIL(parser.parse(sql.string(), pr))) {
+          LOG_WARN("parse describe meta failed", K(ret), K(sql));
+        } else if (OB_ISNULL(pr.result_tree_)
+                   || OB_ISNULL(pr.result_tree_->children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ObSelectResolver sel_resolver(params);
+          if (OB_FAIL(sel_resolver.resolve(*pr.result_tree_->children_[0]))) {
+            LOG_WARN("resolve describe meta failed", K(ret));
+          } else if (OB_ISNULL(meta_stmt = sel_resolver.get_select_stmt())) {
+            ret = OB_ERR_UNEXPECTED;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+}  // anonymous namespace
+
 int ObExplainResolver::resolve(const ParseNode &parse_tree)
 {
   int ret = OB_SUCCESS;
+
+  // ===== FILE_SQL_DESCRIBE_INTERCEPT_BEGIN =====
+  if (T_EXPLAIN == parse_tree.type_ && 5 == parse_tree.num_child_) {
+    const ParseNode *child_node = parse_tree.children_[EXPLAIN_CHILD_STMT];
+    if (OB_NOT_NULL(child_node) && T_SELECT == child_node->type_
+        && file_sql_contains_read_expr(child_node)) {
+      ObStmt *child_stmt = nullptr;
+      ObResolver resolver(params_);
+      if (OB_FAIL(resolver.resolve(ObResolver::IS_NOT_PREPARED_STMT, *child_node, child_stmt))) {
+        LOG_WARN("failed to resolve inner select for describe", K(ret));
+      } else if (OB_ISNULL(child_stmt) || !child_stmt->is_select_stmt()) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ObSelectStmt *meta_stmt = nullptr;
+        if (OB_FAIL(file_sql_build_describe_meta_stmt(params_,
+                *static_cast<ObSelectStmt*>(child_stmt), meta_stmt))) {
+          LOG_WARN("failed to build describe meta stmt", K(ret));
+        } else if (OB_ISNULL(meta_stmt)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          stmt_ = meta_stmt;
+          return OB_SUCCESS;
+        }
+      }
+    }
+  }
+  // ===== FILE_SQL_DESCRIBE_INTERCEPT_END =====
+
+
   ObExplainStmt *explain_stmt = NULL;
   if (!(T_EXPLAIN == parse_tree.type_  && 5 == parse_tree.num_child_)) {
     ret = OB_ERR_UNEXPECTED;
