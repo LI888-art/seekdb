@@ -13468,10 +13468,6 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &table_node, TableItem 
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv sample_size other than -1");
     }
-    if (OB_SUCC(ret) && !header_param) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv header = false");
-    }
   }
 
   bool is_glob = false;
@@ -13677,6 +13673,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &table_node, TableItem 
   std::vector<std::vector<std::string>> data_rows;
   const int64_t MAX_PREVIEW_ROWS = 1000;
   std::vector<CsvInferredType> col_types;
+  size_t csv_data_start = 1;
   if (OB_SUCC(ret)) {
     std::string path_std(path_str.ptr(), path_str.length());
     std::ifstream ifs(path_std.c_str(), std::ios::in | std::ios::binary);
@@ -13701,47 +13698,63 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &table_node, TableItem 
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv on empty file");
       } else {
-        columns = all_rows[0];
-        if (static_cast<int64_t>(columns.size()) > FILE_SQL_MAX_CSV_COLUMNS) {
-          ret = OB_SIZE_OVERFLOW;
-          char err_msg[256];
-          snprintf(err_msg, sizeof(err_msg),
-              "read_csv: column count %ld exceeds limit %ld",
-              static_cast<int64_t>(columns.size()), FILE_SQL_MAX_CSV_COLUMNS);
-          LOG_USER_ERROR(OB_SIZE_OVERFLOW, err_msg);
-        }
-        std::vector<std::string> seen_lower;
-        for (size_t i = 0; OB_SUCC(ret) && i < columns.size(); ++i) {
-          read_csv_trim_str(columns[i]);
-          if (columns[i].empty()) {
-            ret = OB_INVALID_ARGUMENT;
-            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv header empty column");
-            break;
+        if (header_param) {
+          columns = all_rows[0];
+          if (static_cast<int64_t>(columns.size()) > FILE_SQL_MAX_CSV_COLUMNS) {
+            ret = OB_SIZE_OVERFLOW;
+            char err_msg[256];
+            snprintf(err_msg, sizeof(err_msg),
+                "read_csv: column count %ld exceeds limit %ld",
+                static_cast<int64_t>(columns.size()), FILE_SQL_MAX_CSV_COLUMNS);
+            LOG_USER_ERROR(OB_SIZE_OVERFLOW, err_msg);
           }
-          std::string base = columns[i];
-          std::string name = base;
-          int suffix = 2;
-          while (true) {
+          std::vector<std::string> seen_lower;
+          for (size_t i = 0; OB_SUCC(ret) && i < columns.size(); ++i) {
+            read_csv_trim_str(columns[i]);
+            if (columns[i].empty()) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_USER_ERROR(OB_INVALID_ARGUMENT, "read_csv header empty column");
+              break;
+            }
+            std::string base = columns[i];
+            std::string name = base;
+            int suffix = 2;
+            while (true) {
+              std::string lower = name;
+              std::transform(lower.begin(), lower.end(), lower.begin(),
+                             [](unsigned char c) { return std::tolower(c); });
+              bool dup = false;
+              for (const auto &s : seen_lower) {
+                if (s == lower) { dup = true; break; }
+              }
+              if (!dup) break;
+              name = base + "__" + std::to_string(suffix++);
+            }
+            columns[i] = name;
             std::string lower = name;
             std::transform(lower.begin(), lower.end(), lower.begin(),
                            [](unsigned char c) { return std::tolower(c); });
-            bool dup = false;
-            for (const auto &s : seen_lower) {
-              if (s == lower) { dup = true; break; }
-            }
-            if (!dup) break;
-            name = base + "__" + std::to_string(suffix++);
+            seen_lower.push_back(lower);
           }
-          columns[i] = name;
-          std::string lower = name;
-          std::transform(lower.begin(), lower.end(), lower.begin(),
-                         [](unsigned char c) { return std::tolower(c); });
-          seen_lower.push_back(lower);
+        } else {
+          csv_data_start = 0;
+          size_t ncol = all_rows[0].size();
+          if (static_cast<int64_t>(ncol) > FILE_SQL_MAX_CSV_COLUMNS) {
+            ret = OB_SIZE_OVERFLOW;
+            char err_msg[256];
+            snprintf(err_msg, sizeof(err_msg),
+                "read_csv: column count %ld exceeds limit %ld",
+                static_cast<int64_t>(ncol), FILE_SQL_MAX_CSV_COLUMNS);
+            LOG_USER_ERROR(OB_SIZE_OVERFLOW, err_msg);
+          }
+          for (size_t i = 0; OB_SUCC(ret) && i < ncol; ++i) {
+            columns.push_back("c" + std::to_string(i + 1));
+          }
         }
       }
       if (OB_SUCC(ret)) {
         col_types.assign(columns.size(), CsvInferredType::UNKNOWN);
-        for (size_t i = 1; i < all_rows.size()
+        for (size_t i = csv_data_start; i < all_rows.size()
              && static_cast<int64_t>(data_rows.size()) < MAX_PREVIEW_ROWS; ++i) {
           if (all_rows[i].size() != columns.size()) {
             LOG_WARN("read_csv: column count mismatch, skip bad row",
