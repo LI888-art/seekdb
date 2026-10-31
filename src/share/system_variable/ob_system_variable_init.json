@@ -1190,7 +1190,7 @@
     "info": "specifies whether return schema change info in ok packet",
     "flags": "GLOBAL | SESSION | MYSQL_ONLY",
     "publish_version": "312",
-    "info_cn": "\u63a7\u5236\u8fd4\u56de\u7684ok\u5305\u4e2d\u662f\u5426\u5305\u542bschema\u53d8\u66f4\u7684\u4fe1\u606f",
+    "info_cn": "控制返回的ok包中是否包含schema变更的信息",
     "background_cn": "",
     "ref_url": ""
   },
@@ -1203,7 +1203,7 @@
     "info": "specifies whether return system variables change info in ok packet",
     "flags": "GLOBAL | SESSION | MYSQL_ONLY",
     "publish_version": "312",
-    "info_cn": "\u63a7\u5236\u8fd4\u56de\u7684ok\u5305\u4e2d\u662f\u5426\u5305\u542b\u7cfb\u7edf\u53d8\u91cf\u53d8\u66f4\u7684\u4fe1\u606f",
+    "info_cn": "控制返回的ok包中是否包含系统变量变更的信息",
     "background_cn": "",
     "ref_url": ""
   },
@@ -1216,7 +1216,7 @@
     "info": "specifies whether return session state change info in ok packet",
     "flags": "GLOBAL | SESSION | MYSQL_ONLY",
     "publish_version": "312",
-    "info_cn": "\u63a7\u5236\u8fd4\u56de\u7684ok\u5305\u4e2d\u662f\u5426\u5305\u542bsession\u72b6\u6001\u53d8\u66f4\u7684\u4fe1\u606f",
+    "info_cn": "控制返回的ok包中是否包含session状态变更的信息",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2455,8 +2455,21 @@
     "info": "limit the effect of data import and export operations",
     "flags": "GLOBAL | INFLUENCE_PLAN | NULL",
     "publish_version": "226",
-    "info_cn": "\u9650\u5236\u5bfc\u5165\u5bfc\u51fa\u529f\u80fd\u8bbf\u95ee\u7684\u8def\u5f84",
-    "background_cn": "\u5bfc\u5165\u5bfc\u51fa\u529f\u80fd\u672a\u9650\u5236\u6587\u4ef6\u8bbf\u95ee\u53ef\u80fd\u5b58\u5728\u6f0f\u6d1e",
+    "info_cn": "限制导入导出功能访问的路径",
+    "background_cn": "导入导出功能未限制文件访问可能存在漏洞",
+    "ref_url": ""
+  },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Enable file SQL (read_csv/read_json/read_parquet)",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
+    "publish_version": "",
+    "info_cn": "是否开启文件即数据库功能",
+    "background_cn": "赛题二：文件即数据库，默认关闭",
     "ref_url": ""
   },
   "_enable_parallel_query": {
@@ -2468,8 +2481,8 @@
     "info": "A QUERY statement can be parallelized only if you have explicitly enabled parallel QUERY in the session or in the SQL statement.",
     "flags": "SESSION | NEED_SERIALIZE | INVISIBLE | INFLUENCE_PLAN",
     "publish_version": "227",
-    "info_cn": "\u5728session\u4e0a\u6253\u5f00parallel query\u914d\u7f6e\u9879\uff0c\u67e5\u8be2\u9ed8\u8ba4\u60c5\u51b5\u4e0b\u624d\u53ef\u4ee5\u88ab\u5e76\u884c\u6267\u884c\uff08parallel>=2)",
-    "background_cn": "px\u4e0a\u63a7\u5236parallel\u7684\u65b9\u5f0f\u6709\u5f88\u591a\uff0csession\u4e0a\u6709\u5bf9\u5e94\u7684parallel\u7684\u63a7\u5236\u5f00\u5173\uff0c\u8fd9\u4e2a\u5f00\u5173\u7528\u4e8e\u63a7\u5236session\u7ea7\u522b\u7684\u9ed8\u8ba4\u5e76\u884c\u5ea6\u662f\u5426\u53ef\u4ee5\u5927\u4e8e\u7b49\u4e8e2",
+    "info_cn": "在session上打开parallel query配置项，查询默认情况下才可以被并行执行（parallel>=2)",
+    "background_cn": "px上控制parallel的方式有很多，session上有对应的parallel的控制开关，这个开关用于控制session级别的默认并行度是否可以大于等于2",
     "ref_url": ""
   },
   "_force_parallel_query_dop": {
@@ -2481,8 +2494,8 @@
     "info": "A QUERY statement can be parallelized only if you have explicitly enabled parallel QUERY in the session or in the SQL statement.",
     "flags": "SESSION | NEED_SERIALIZE | INVISIBLE | INFLUENCE_PLAN",
     "publish_version": "310",
-    "info_cn": "\u5728session\u4e0a\u6253\u5f00parallel query\u914d\u7f6e\u9879\uff0c\u5e76\u6307\u5b9a\u9ed8\u8ba4\u5e76\u884c\u5ea6",
-    "background_cn": "px\u4e0a\u63a7\u5236parallel\u7684\u65b9\u5f0f\u6709\u5f88\u591a\uff0csession\u4e0a\u6709\u5bf9\u5e94\u7684parallel\u7684\u63a7\u5236\u5f00\u5173\uff0c\u8fd9\u4e2a\u53d8\u91cf\u7528\u4e8e\u8bbe\u7f6esession\u7ea7\u522b\u7684 query \u9ed8\u8ba4\u5e76\u884c\u5ea6\u5927\u5c0f",
+    "info_cn": "在session上打开parallel query配置项，并指定默认并行度",
+    "background_cn": "px上控制parallel的方式有很多，session上有对应的parallel的控制开关，这个变量用于设置session级别的 query 默认并行度大小",
     "ref_url": ""
   },
   "_force_parallel_dml_dop": {
@@ -2494,8 +2507,8 @@
     "info": "A QUERY statement can be parallelized only if you have explicitly enabled parallel QUERY in the session or in the SQL statement.",
     "flags": "SESSION | NEED_SERIALIZE | INVISIBLE | INFLUENCE_PLAN",
     "publish_version": "310",
-    "info_cn": "\u5728session\u4e0a\u6253\u5f00parallel dml\u914d\u7f6e\u9879\uff0c\u5e76\u6307\u5b9a\u9ed8\u8ba4\u5e76\u884c\u5ea6\u3002\u5f53\u672a\u901a\u8fc7 hint \u6307\u5b9a dml \u5e76\u884c\u5ea6\u65f6\uff0c\u4f1a\u4f7f\u7528\u672c\u53d8\u91cf\u503c\u4f5c\u4e3a\u9ed8\u8ba4\u5e76\u884c\u5ea6",
-    "background_cn": "px\u4e0a\u63a7\u5236parallel\u7684\u65b9\u5f0f\u6709\u5f88\u591a\uff0csession\u4e0a\u6709\u5bf9\u5e94\u7684parallel\u7684\u63a7\u5236\u5f00\u5173\uff0c\u8fd9\u4e2a\u53d8\u91cf\u7528\u4e8e\u8bbe\u7f6esession\u7ea7\u522b\u7684 dml \u9ed8\u8ba4\u5e76\u884c\u5ea6\u5927\u5c0f",
+    "info_cn": "在session上打开parallel dml配置项，并指定默认并行度。当未通过 hint 指定 dml 并行度时，会使用本变量值作为默认并行度",
+    "background_cn": "px上控制parallel的方式有很多，session上有对应的parallel的控制开关，这个变量用于设置session级别的 dml 默认并行度大小",
     "ref_url": ""
   },
   "ob_pl_block_timeout": {
@@ -2527,8 +2540,8 @@
     "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
     "base_class": "ObSessionSpecialBoolSysVar",
     "publish_version": "320",
-    "info_cn": "\u63a7\u5236\u662f\u5426\u53ea\u5141\u8bb8\u5f00\u542f\u53ea\u8bfb\u4e8b\u52a1",
-    "background_cn": "\u7528\u6237\u53ef\u4ee5\u901a\u8fc7\u8fd9\u4e24\u4e2a\u53d8\u91cf\u8bbf\u95ee\u6216\u8005\u8bbe\u7f6e\u4e8b\u52a1\u7684\u8bbf\u95ee\u6a21\u5f0f\uff0c\u5f53transaction_read_only\u8bbe\u7f6e\u4e3atrue\u65f6\uff0c\u4e0d\u5141\u8bb8\u6267\u884cdml\u8bed\u53e5",
+    "info_cn": "控制是否只允许开启只读事务",
+    "background_cn": "用户可以通过这两个变量访问或者设置事务的访问模式，当transaction_read_only设置为true时，不允许执行dml语句",
     "ref_url": ""
   },
   "performance_schema": {
@@ -2540,8 +2553,8 @@
     "info": "indicate whether the Performance Schema is enabled",
     "flags": "GLOBAL",
     "publish_version": "227",
-    "info_cn": "\u5411\u5ba2\u6237\u7aef\u58f0\u660e\u662f\u5426\u652f\u6301 performance \u4fe1\u606f\u67e5\u8be2",
-    "background_cn": "\u7eaf\u517c\u5bb9\u6027\u53d8\u91cf\u3002\u4e0d\u652f\u6301 performance_schema \u7cfb\u7edf\u53d8\u91cf\uff0c\u5bfc\u81f4 8.0 JDBC \u9a71\u52a8\u5728\u8fde\u63a5\u8ba4\u8bc1\u540e\u521d\u59cb\u5316\u7cfb\u7edf\u53d8\u91cf\u9636\u6bb5\u6267\u884c select @performance_schema \u629b\u51fa\u5f02\u5e38",
+    "info_cn": "向客户端声明是否支持 performance 信息查询",
+    "background_cn": "纯兼容性变量。不支持 performance_schema 系统变量，导致 8.0 JDBC 驱动在连接认证后初始化系统变量阶段执行 select @performance_schema 抛出异常",
     "ref_url": ""
   },
   "_ob_proxy_session_temporary_table_used": {
@@ -2554,8 +2567,8 @@
     "info": "this value is true if we have executed set transaction stmt, until a transaction commit(explicit or implicit) successfully",
     "flags": "READONLY | SESSION | INVISIBLE",
     "publish_version": "310",
-    "info_cn": "\u6807\u8bb0\u5f53\u524dSession\u662f\u5426\u4f7f\u7528\u8fc7Session\u7ea7\u522b\u4e34\u65f6\u8868\uff0c\u7528\u4e8e\u544a\u77e5proxy\u5e76\u4fee\u6539\u8def\u7531\u51b3\u7b56",
-    "background_cn": "\u4e3a\u4e86\u89e3\u51b3Session\u4e34\u65f6\u8868\u65ad\u94fe\u63a5\u65f6\u53ef\u80fd\u5bfc\u81f4\u7684\u95ee\u9898\uff0c\u5f53Session\u4e34\u65f6\u8868\u7b2c\u4e00\u6b21\u4f7f\u7528\u540e\uff0c\u540e\u7eed\u8bf7\u6c42Proxy\u53ea\u4f1a\u8def\u7531\u5230\u540c\u4e00\u4e2aSession",
+    "info_cn": "标记当前Session是否使用过Session级别临时表，用于告知proxy并修改路由决策",
+    "background_cn": "为了解决Session临时表断链接时可能导致的问题，当Session临时表第一次使用后，后续请求Proxy只会路由到同一个Session",
     "ref_url": ""
   },
   "_enable_parallel_ddl": {
@@ -2567,7 +2580,7 @@
     "info": "A DDL statement can be parallelized only if you have explicitly enabled parallel DDL in the session or in the SQL statement.",
     "flags": "SESSION | NEED_SERIALIZE | INVISIBLE | INFLUENCE_PLAN",
     "publish_version": "330",
-    "info_cn": "\u6807\u8bb0Session\u4e0a\u5e76\u884cDDL\u662f\u5426\u88ab\u6253\u5f00",
+    "info_cn": "标记Session上并行DDL是否被打开",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2580,8 +2593,8 @@
     "info": "A DDL statement can be parallelized only if you have explicitly enabled parallel DDL in the session or in the SQL statement.",
     "flags": "SESSION | NEED_SERIALIZE | INVISIBLE | INFLUENCE_PLAN",
     "publish_version": "330",
-    "info_cn": "\u5728session\u4e0a\u6253\u5f00parallel ddl\u914d\u7f6e\u9879\uff0c\u5e76\u6307\u5b9a\u9ed8\u8ba4\u5e76\u884c\u5ea6\u3002\u5f53\u672a\u901a\u8fc7 hint \u6307\u5b9a ddl \u5e76\u884c\u5ea6\u65f6\uff0c\u4f1a\u4f7f\u7528\u672c\u53d8\u91cf\u503c\u4f5c\u4e3a\u9ed8\u8ba4\u5e76\u884c\u5ea6",
-    "background_cn": "ddl\u4e0a\u63a7\u5236parallel\u7684\u65b9\u5f0f\u6709\u5f88\u591a\uff0csession\u4e0a\u6709\u5bf9\u5e94\u7684parallel\u7684\u63a7\u5236\u5f00\u5173\uff0c\u8fd9\u4e2a\u53d8\u91cf\u7528\u4e8e\u8bbe\u7f6esession\u7ea7\u522b\u7684 ddl \u9ed8\u8ba4\u5e76\u884c\u5ea6\u5927\u5c0f",
+    "info_cn": "在session上打开parallel ddl配置项，并指定默认并行度。当未通过 hint 指定 ddl 并行度时，会使用本变量值作为默认并行度",
+    "background_cn": "ddl上控制parallel的方式有很多，session上有对应的parallel的控制开关，这个变量用于设置session级别的 ddl 默认并行度大小",
     "ref_url": ""
   },
   "cursor_sharing": {
@@ -2597,7 +2610,7 @@
       "EXACT"
     ],
     "publish_version": "330",
-    "info_cn": "\u5728session\u4e0a\u6253\u5f00\u63a7\u5236\u662f\u5426\u53c2\u6570\u5316\u7684\u914d\u7f6e\u9879\u3002\u5f53\u5904\u4e8eexact\u6a21\u5f0f\u65f6,\u4e0d\u8fdb\u884c\u53c2\u6570\u5316;\u5904\u4e8eForce\u6a21\u5f0f\u65f6,\u8fdb\u884c\u53c2\u6570\u5316\u3002\u9ed8\u8ba4\u8fdb\u884c\u53c2\u6570\u5316\u3002",
+    "info_cn": "在session上打开控制是否参数化的配置项。当处于exact模式时,不进行参数化;处于Force模式时,进行参数化。默认进行参数化。",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2611,7 +2624,7 @@
     "info": "specifies whether null aware anti join plan allow generated",
     "flags": "GLOBAL | SESSION",
     "publish_version": "330",
-    "info_cn": "\u63a7\u5236\u4f18\u5316\u5668\u80fd\u5426\u751f\u6210null aware anti join \u7684\u8ba1\u5212",
+    "info_cn": "控制优化器能否生成null aware anti join 的计划",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2661,8 +2674,8 @@
     "info": "control audit log trail job in mysql mode",
     "flags": "GLOBAL | MYSQL_ONLY | INVISIBLE",
     "publish_version": "330",
-    "info_cn": "\u521b\u5efamysql\u6a21\u5f0f\u7684\u5ba1\u8ba1\u65e5\u5fd7\u5b9a\u671f\u6e05\u7406\u4efb\u52a1",
-    "background_cn": "\u793a\u4f8b: create_audit_purge_job='trail_type:interval:jobname:use_last_archive_timestamp'",
+    "info_cn": "创建mysql模式的审计日志定期清理任务",
+    "background_cn": "示例: create_audit_purge_job='trail_type:interval:jobname:use_last_archive_timestamp'",
     "ref_url": ""
   },
   "_drop_audit_purge_job": {
@@ -2675,8 +2688,8 @@
     "info": "drop audit log trail job in mysql mode",
     "flags": "GLOBAL | MYSQL_ONLY | INVISIBLE",
     "publish_version": "330",
-    "info_cn": "\u5220\u9664mysql\u6a21\u5f0f\u7684\u5ba1\u8ba1\u65e5\u5fd7\u5b9a\u671f\u6e05\u7406\u4efb\u52a1",
-    "background_cn": "\u793a\u4f8b: drop_audit_purge_job='jobname'",
+    "info_cn": "删除mysql模式的审计日志定期清理任务",
+    "background_cn": "示例: drop_audit_purge_job='jobname'",
     "ref_url": ""
   },
   "_set_purge_job_interval": {
@@ -2689,8 +2702,8 @@
     "info": "set purge job interval in mysql mode, range in 1-999 days",
     "flags": "GLOBAL | MYSQL_ONLY | INVISIBLE",
     "publish_version": "330",
-    "info_cn": "\u66f4\u65b0purge job\u7684interval\u65f6\u95f4",
-    "background_cn": "\u793a\u4f8b: set_purge_job_interval='jobname:interval'",
+    "info_cn": "更新purge job的interval时间",
+    "background_cn": "示例: set_purge_job_interval='jobname:interval'",
     "ref_url": ""
   },
   "_set_purge_job_status": {
@@ -2703,8 +2716,8 @@
     "info": "set purge job status in mysql mode, range: true/false",
     "flags": "GLOBAL | MYSQL_ONLY | INVISIBLE",
     "publish_version": "330",
-    "info_cn": "\u66f4\u65b0purge job\u7684\u72b6\u6001\uff0c\u63a7\u5236job\u662f\u5426\u751f\u6548",
-    "background_cn": "\u793a\u4f8b: set_purge_job_status='jobname:status'",
+    "info_cn": "更新purge job的状态，控制job是否生效",
+    "background_cn": "示例: set_purge_job_status='jobname:status'",
     "ref_url": ""
   },
   "_set_last_archive_timestamp": {
@@ -2717,8 +2730,8 @@
     "info": "set last archive timestamp in mysql mode, must utc time in usec from 1970",
     "flags": "GLOBAL | MYSQL_ONLY | INVISIBLE",
     "publish_version": "330",
-    "info_cn": "\u8bbe\u7f6e\u5220\u9664\u7684\u65f6\u95f4\u70b9\u4fe1\u606f\uff0c\u9700\u8981\u4f7f\u7528\u4ece1970\u5f00\u59cb\u7684utc\u65f6\u95f4\uff0c\u5fae\u5999\u4e3a\u5355\u4f4d",
-    "background_cn": "\u793a\u4f8b: set_last_archive_timestamp='trail_type:timestamp'",
+    "info_cn": "设置删除的时间点信息，需要使用从1970开始的utc时间，微妙为单位",
+    "background_cn": "示例: set_last_archive_timestamp='trail_type:timestamp'",
     "ref_url": ""
   },
   "_clear_last_archive_timestamp": {
@@ -2731,8 +2744,8 @@
     "info": "clear last archive timestamp in mysql mode",
     "flags": "GLOBAL | MYSQL_ONLY | INVISIBLE",
     "publish_version": "330",
-    "info_cn": "\u6e05\u9664\u5220\u9664\u7684\u65f6\u95f4\u70b9\u4fe1\u606f",
-    "background_cn": "\u793a\u4f8b: clear_last_archive_timestamp='trail_type'",
+    "info_cn": "清除删除的时间点信息",
+    "background_cn": "示例: clear_last_archive_timestamp='trail_type'",
     "ref_url": ""
   },
   "_aggregation_optimization_settings": {
@@ -2745,7 +2758,7 @@
     "flags": "GLOBAL | SESSION",
     "publish_version": "330",
     "info_cn": "",
-    "background_cn": "\u7528\u4e8e\u8c03\u4f18group by \u548cdistinct\u7684\u6267\u884c\u884c\u4e3a",
+    "background_cn": "用于调优group by 和distinct的执行行为",
     "ref_url": ""
   },
   "_px_shared_hash_join": {
@@ -2783,7 +2796,7 @@
     "info": "in certain case, warnings would be transformed to errors",
     "flags": "GLOBAL | SESSION",
     "publish_version": "400",
-    "info_cn": "\u7279\u5b9a\u573a\u5408\u4e0b\uff0c\u8b66\u544a\u4f1a\u5f53\u6210\u9519\u8bef\u8fd4\u56de",
+    "info_cn": "特定场合下，警告会当成错误返回",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2798,7 +2811,7 @@
     "info": "settings for window function optimizations",
     "flags": "GLOBAL | SESSION",
     "publish_version": "400",
-    "info_cn": "window function\u4f18\u5316\u8bbe\u7f6e",
+    "info_cn": "window function优化设置",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2853,7 +2866,7 @@
     "info": "control wether we need to gather optimizer stats on insert into select/create table as select",
     "flags": "GLOBAL | SESSION",
     "publish_version": "400",
-    "info_cn": "\u63a7\u5236\u5728insert into select\u4e0b\u662f\u5426\u9ed8\u8ba4\u6536\u96c6\u7edf\u8ba1\u4fe1\u606f",
+    "info_cn": "控制在insert into select下是否默认收集统计信息",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2866,7 +2879,7 @@
     "info": "When enabled, show create table will show the strict compatible results with the compatibility mode.",
     "flags": "SESSION",
     "publish_version": "324",
-    "info_cn": "\u542f\u7528\u540e, show create table \u5c06\u5c55\u793a\u4e0e\u517c\u5bb9\u6a21\u5f0f\u4e25\u683c\u517c\u5bb9\u7684\u7ed3\u679c",
+    "info_cn": "启用后, show create table 将展示与兼容模式严格兼容的结果",
     "background_cn": "",
     "ref_url": "/"
   },
@@ -2883,7 +2896,7 @@
     "info": "specifies whether automatic degree of parallelism will be enabled",
     "flags": "GLOBAL | SESSION | INFLUENCE_PLAN",
     "publish_version": "420",
-    "info_cn": "\u63a7\u5236\u5e76\u884c\u5ea6\u9009\u62e9\u7b56\u7565",
+    "info_cn": "控制并行度选择策略",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2898,7 +2911,7 @@
     "min_val": "0",
     "max_val": "9223372036854775807",
     "publish_version": "420",
-    "info_cn": "\u4f7f\u7528 Auto DOP \u7b56\u7565\u65f6, \u9650\u5236\u4f18\u5316\u5668\u9009\u62e9\u5e76\u884c\u5ea6\u4e0a\u9650\u503c",
+    "info_cn": "使用 Auto DOP 策略时, 限制优化器选择并行度上限值",
     "background_cn": "",
     "ref_url": ""
   },
@@ -2913,7 +2926,7 @@
     "min_val": "10",
     "max_val": "9223372036854775807",
     "publish_version": "420",
-    "info_cn": "\u4f7f\u7528 Auto DOP \u7b56\u7565\u65f6, \u589e\u5927\u57fa\u8868\u626b\u63cf\u5e76\u884c\u5ea6\u53c2\u8003\u6267\u884c\u65f6\u95f4, \u5355\u4f4d ms",
+    "info_cn": "使用 Auto DOP 策略时, 增大基表扫描并行度参考执行时间, 单位 ms",
     "background_cn": "",
     "ref_url": ""
   },
@@ -3169,7 +3182,7 @@
       "ON"
     ],
     "publish_version": "430",
-    "info_cn": "\u6307\u5b9aInnoDB\u7d22\u5f15\u7edf\u8ba1\u4fe1\u606f\u662f\u5426\u6301\u4e45\u5316\u5230\u78c1\u76d8",
+    "info_cn": "指定InnoDB索引统计信息是否持久化到磁盘",
     "background_cn": "",
     "ref_url": ""
   },
@@ -5562,7 +5575,7 @@
     "to_show_str_func": "ObSysVarToStrFuncs::to_str_collation",
     "base_class": "ObCharsetSysVar",
     "publish_version": "424",
-    "info_cn": "\u7528\u4e8e\u8bbe\u7f6eutf8mb4\u5b57\u7b26\u96c6\u9ed8\u8ba4\u7684\u5b57\u7b26\u96c6",
+    "info_cn": "用于设置utf8mb4字符集默认的字符集",
     "background_cn": "",
     "ref_url": ""
   },
@@ -5576,7 +5589,7 @@
     "info": "control wether to enable old charset aggregation rule",
     "flags": "GLOBAL | SESSION | INFLUENCE_PLAN | NEED_SERIALIZE | MYSQL_ONLY | INVISIBLE | INFLUENCE_PL",
     "publish_version": "424",
-    "info_cn": "\u7528\u4e8e\u63a7\u5236\u662f\u5426\u4f7f\u7528\u65e7\u7248\u5b57\u7b26\u96c6\u63a8\u5bfc\u89c4\u5219",
+    "info_cn": "用于控制是否使用旧版字符集推导规则",
     "background_cn": "",
     "ref_url": ""
   },
@@ -10900,7 +10913,7 @@
       "ON"
     ],
     "publish_version": "435",
-    "info_cn": "\u63a7\u5236\u4f18\u5316\u5668\u5728\u57fa\u6570\u4f30\u8ba1\u65f6\u662f\u5426\u8003\u8651\u884c\u6570\u76ee\u6807\uff08\u5982 LIMIT \u7b97\u5b50\u7b49\uff09\u7684\u5f71\u54cd",
+    "info_cn": "控制优化器在基数估计时是否考虑行数目标（如 LIMIT 算子等）的影响",
     "background_cn": "",
     "ref_url": ""
   },
@@ -10957,7 +10970,7 @@
     "info": "control whether the optimizer pushes down join predicates to view",
     "flags": "SESSION | GLOBAL | INVISIBLE | INFLUENCE_PLAN",
     "publish_version": "1.0.0.0",
-    "info_cn": "\u63a7\u5236\u4f18\u5316\u5668\u662f\u5426\u5c06\u8fde\u63a5\u8c13\u8bcd\u4e0b\u63a8\u5230\u89c6\u56fe",
+    "info_cn": "控制优化器是否将连接谓词下推到视图",
     "background_cn": "",
     "ref_url": ""
   },
@@ -10972,21 +10985,6 @@
     "min_val": "0",
     "max_val": "100",
     "publish_version": "1.0.0.0",
-    "info_cn": "",
-    "background_cn": "",
-    "ref_url": ""
-  },
-  "enable_file_sql": {
-    "id": 10755,
-    "name": "enable_file_sql",
-    "default_value": "0",
-    "base_value": "0",
-    "data_type": "bool",
-    "info": "Enable file sql",
-    "flags": "GLOBAL | SESSION | NEED_SERIALIZE",
-    "min_val": "0",
-    "max_val": "1",
-    "publish_version": "",
     "info_cn": "",
     "background_cn": "",
     "ref_url": ""
