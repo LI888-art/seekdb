@@ -298,8 +298,7 @@ END_P SET_VAR DELIMITER
         INNODB INPLACE INSERT_METHOD INSTANT INSTANCE INVOKER IO IO_THREAD IPC ISOLATE ISOLATION ISSUER
         INVISIBLE MERGE ISNULL INTERSECT INCREMENTAL INNER_PARSE ILOGCACHE INPUT INDEXED INCONSISTENT INDIVIDUAL
 
-        JOB JSON JSON_ARRAYAGG JSON_OBJECTAGG JSON_QUERY JSON_VALUE JSON_TABLE
-
+                JOB JSON JSON_ARRAYAGG JSON_OBJECTAGG JSON_QUERY JSON_VALUE JSON_TABLE
         KEYWORD KEY_BLOCK_SIZE KEY_VERSION KVCACHE
 
         LAG LANGUAGE LAST LAST_VALUE LATERAL LEAD LEADER LEAVES LESS LIB LINESTRING
@@ -497,7 +496,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
-%type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> read_csv_expr json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def read_csv_param_list
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -10835,6 +10834,10 @@ tbl_name
 {
   $$ = $1;
 }
+| read_csv_expr
+{
+  $$ = $1;
+}
 | '(' table_references ')'
 {
   $$ = $2;
@@ -16623,6 +16626,40 @@ DAY
 *
 *  JSON TABLE
 *============================================================*/
+
+read_csv_expr:
+NAME_OB '(' simple_expr ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_JSON_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+| NAME_OB '(' simple_expr ')'
+{
+  ParseNode *alias_node = NULL;
+  make_name_node(alias_node, result->malloc_pool_, "");
+  malloc_non_terminal_node($$, result->malloc_pool_, T_JSON_TABLE_EXPRESSION, 3, $1, $3, alias_node);
+}
+| NAME_OB '(' simple_expr ',' read_csv_param_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_JSON_TABLE_EXPRESSION, 4, $1, $3, $5, $7);
+}
+| NAME_OB '(' simple_expr ',' read_csv_param_list ')'
+{
+  ParseNode *alias_node = NULL;
+  make_name_node(alias_node, result->malloc_pool_, "");
+  malloc_non_terminal_node($$, result->malloc_pool_, T_JSON_TABLE_EXPRESSION, 4, $1, $3, $5, alias_node);
+}
+;
+
+read_csv_param_list:
+expr
+{
+  malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1);
+}
+| read_csv_param_list ',' expr
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
 
 json_table_expr:
 JSON_TABLE '(' simple_expr ',' literal mock_jt_on_error_on_empty COLUMNS '(' jt_column_list ')' ')' relation_name
