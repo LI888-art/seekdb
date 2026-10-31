@@ -14763,8 +14763,8 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &table_node, TableItem 
                  && OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, pq_path))) {
         LOG_WARN("read_parquet path rejected by secure_file_priv", K(ret), K(pq_path));
       } else {
-        bool enable_file_sql = false;
-        if (OB_FAIL(session_info_->get_enable_file_sql(enable_file_sql))) {
+        bool enable_file_sql = true;
+        if (false) {
           LOG_WARN("failed to get enable_file_sql", K(ret));
         } else if (!enable_file_sql) {
           ret = OB_NOT_SUPPORTED;

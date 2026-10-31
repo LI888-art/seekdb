@@ -929,17 +929,11 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
   }
-  if (obj.is_null() && external_properties_.csv_format_.null_if_.count() > 0) {
-    ObObj null_obj;
-    null_obj.set_varchar(external_properties_.csv_format_.null_if_.at(0));
-    null_obj.set_collation_type(cs_type_);
-    OZ(write_obj_to_file(null_obj, data_writer, false));
-  } else if (obj.is_null()) {
-    char backslash = '\\';
-    OZ(write_single_char_to_file(&backslash, data_writer));
-    OZ(write_single_char_to_file(&char_n, data_writer));
-  } else if (!has_escape_) {
+  if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
+  } else if (obj.is_null()) {
+    OZ(write_single_char_to_file(&char_escape_, data_writer));
+    OZ(write_single_char_to_file(&char_n, data_writer));
   } else {
     OZ(write_obj_to_file(obj, data_writer, true));
   }
