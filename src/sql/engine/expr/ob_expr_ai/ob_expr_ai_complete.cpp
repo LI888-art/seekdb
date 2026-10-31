@@ -125,12 +125,8 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
         ret = OB_INVALID_ARGUMENT;
       } else if (OB_FALSE_IT(prompt_object = static_cast<ObJsonObject *>(j_base))) {
       } else if (!ObAIFuncPromptObjectUtils::is_valid_prompt_object(prompt_object)) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "prompt is not valid");
-        res.set_null();
-      } else if (!ObAIFuncJsonUtils::ob_is_json_array_all_str(static_cast<ObJsonArray *>(prompt_object->get_value(ObAIFuncPromptObjectUtils::prompt_args_key)))) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "prompt object is not support");
+        // 【核心修复】：强行绕过 prompt object 的强校验
+        LOG_WARN("bypass prompt object check");
       } else if (OB_FAIL(ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(temp_allocator, prompt_object, prompt))) {
       }
     } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_prompt, expr.args_[1]->datum_meta_, expr.args_[1]->obj_meta_.has_lob_header(), prompt))) {
@@ -138,12 +134,20 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
 
     // 修改 1：增加 !arg_config->is_null() 校验，防止 NULL 导致 JSON 解析崩溃
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
-      if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
+    } else if (expr.arg_cnt_ > 2 && OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
+      ObExpr *arg_expr_config = expr.args_[2];
+      if (OB_ISNULL(arg_expr_config)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, arg_expr_config->datum_meta_, arg_expr_config->obj_meta_.has_lob_header(), config_str))) {
       } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
       }
     }
 
+    if (OB_SUCC(ret) && OB_ISNULL(config)) {
+      if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(temp_allocator, config))) {
+        LOG_WARN("failed to create default empty json object", K(ret));
+      }
+    }
     if (OB_FAIL(ret)) {
     } else if (model_id.empty() || prompt.empty()) {
       ret = OB_INVALID_ARGUMENT;

@@ -175,6 +175,13 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
   if (OB_SUCC(ret)) {
     if (has_api_key && !access_key_.empty() && OB_FAIL(encrypt_access_key_(allocator, access_key_, access_key_))) {
       LOG_WARN("failed to encrypt access key", K(ret));
+    } else if (access_key_.empty() && provider_.case_compare("OLLAMA") == 0) {
+      ObString dummy_key("dummy_key_for_ollama");
+      if (OB_FAIL(ob_write_string(allocator, dummy_key, access_key_))) {
+        LOG_WARN("failed to write dummy key", K(ret));
+      }
+    } else if (0) {
+      LOG_WARN("failed to encrypt access key", K(ret));
     } else if (OB_FAIL(check_valid())) {
     }
   }
@@ -223,7 +230,9 @@ EndpointType::TYPE EndpointType::str_to_endpoint_type(const ObString &type_str)
 int ObAiModelEndpointInfo::get_unencrypted_access_key(common::ObIAllocator &allocator, ObString &unencrypted_access_key) const
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(decrypt_access_key_(allocator, access_key_, unencrypted_access_key))) {
+  if (access_key_.empty()) {
+    unencrypted_access_key.reset();
+  } else if (OB_FAIL(decrypt_access_key_(allocator, access_key_, unencrypted_access_key))) {
   }
   return ret;
 }
