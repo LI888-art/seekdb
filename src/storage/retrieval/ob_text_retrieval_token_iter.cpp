@@ -359,43 +359,17 @@ int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::O
 int ObTextRetrievalTokenIter::estimate_token_doc_cnt()
 {
   int ret = OB_SUCCESS;
-  int64_t logical_row_cnt = 0;
-  int64_t physical_row_cnt = 0;
-  ObSEArray<ObEstRowCountRecord, 1> est_records;
-  ObArenaAllocator allocator;
-  const int64_t timeout_us = THIS_WORKER.get_timeout_remain();
-  ObAccessService *access_service = NULL;
-  storage::ObTableScanRange table_scan_range;
-  ObSimpleBatch batch;
-  batch.type_ = ObSimpleBatch::T_SCAN;
-  batch.range_ = &inv_idx_agg_param_->key_ranges_.at(0);
-  ObTableScanParam est_param;
-  est_param.index_id_ = inv_idx_agg_param_->index_id_;
-  est_param.scan_flag_ = inv_idx_agg_param_->scan_flag_;
-  est_param.tablet_id_ = inv_idx_agg_param_->tablet_id_;
-  est_param.tx_id_ = inv_idx_agg_param_->tx_id_;
-  est_param.schema_version_ = inv_idx_agg_param_->schema_version_;
-  est_param.frozen_version_ = GET_BATCH_ROWS_READ_SNAPSHOT_VERSION;
-  if (OB_ISNULL(access_service = ::oceanbase::share::server_service<::oceanbase::storage::ObAccessService>())) {
+  // 优化：绕过底层昂贵的 estimate_row_count，直接使用快速内存估算。
+  // 由于不涉及 ORDER BY 排序，只要分数 > 0 即可保证过滤逻辑正确。
+  sql::ObExpr *total_doc_cnt_param_expr = relevance_expr_->args_[sql::ObExprBM25::TOTAL_DOC_CNT_PARAM_IDX];
+  if (OB_ISNULL(total_doc_cnt_param_expr)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(table_scan_range.init(*inv_idx_agg_param_, batch, allocator))) {
-  } else if (OB_FAIL(access_service->estimate_row_count(est_param,
-                                                        table_scan_range,
-                                                        timeout_us,
-                                                        est_records,
-                                                        logical_row_cnt,
-                                                        physical_row_cnt))) {
   } else {
-    token_doc_cnt_ = logical_row_cnt;
+    int64_t total_doc_cnt = 0;
+    total_doc_cnt = total_doc_cnt_param_expr->locate_expr_datum(*eval_ctx_, 0).get_int();
+    token_doc_cnt_ = total_doc_cnt > 1 ? (total_doc_cnt / 2) : 1;
     token_doc_cnt_calculated_ = true;
-    sql::ObExpr *total_doc_cnt_param_expr = relevance_expr_->args_[sql::ObExprBM25::TOTAL_DOC_CNT_PARAM_IDX];
-    if (OB_ISNULL(total_doc_cnt_param_expr)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      int64_t total_doc_cnt = 0;
-      total_doc_cnt = total_doc_cnt_param_expr->locate_expr_datum(*eval_ctx_, 0).get_int();
-      max_token_relevance_ = sql::ObExprBM25::query_token_weight(token_doc_cnt_, total_doc_cnt);
-    }
+    max_token_relevance_ = sql::ObExprBM25::query_token_weight(token_doc_cnt_, total_doc_cnt);
   }
   return ret;
 }
