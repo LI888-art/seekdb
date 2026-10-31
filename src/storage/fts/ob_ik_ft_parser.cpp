@@ -1,3 +1,4 @@
+#include <mutex>
 /*
  * Copyright (c) 2025 OceanBase.
  *
@@ -228,42 +229,46 @@ int ObIKFTParserDesc::get_add_word_flag(ObAddWordFlag &flag) const
 int ObIKFTParser::init_dict(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
-  ObIFTDict *tmp_dict = nullptr;
-
   if (OB_ISNULL(hub_)) {
     ret = OB_ERR_UNEXPECTED;
   }
 
-  ObFTRangeDict *dict = nullptr;
-  ObFTDictDesc main_dict_desc("main_dict",
-                              ObFTDictType::DICT_IK_MAIN,
-                              ObCharsetType::CHARSET_UTF8MB4,
-                              ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  ObFTDictDesc main_dict_desc("main_dict", ObFTDictType::DICT_IK_MAIN, ObCharsetType::CHARSET_UTF8MB4, ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  ObFTDictDesc quan_dict_desc("quan_dict", ObFTDictType::DICT_IK_QUAN, ObCharsetType::CHARSET_UTF8MB4, ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  ObFTDictDesc stopword_dict_desc("stopword", ObFTDictType::DICT_IK_STOP, ObCharsetType::CHARSET_UTF8MB4, ObCollationType::CS_TYPE_UTF8MB4_BIN);
 
-  ObFTDictDesc quan_dict_desc("quan_dict",
-                              ObFTDictType::DICT_IK_QUAN,
-                              ObCharsetType::CHARSET_UTF8MB4,
-                              ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  static ObArenaAllocator global_dict_alloc("IKGlobalDict");
+  static ObFTCacheRangeContainer global_cache_main(global_dict_alloc);
+  static ObFTCacheRangeContainer global_cache_quan(global_dict_alloc);
+  static ObFTCacheRangeContainer global_cache_stop(global_dict_alloc);
+  static ObIFTDict *global_dict_main = nullptr;
+  static ObIFTDict *global_dict_quan = nullptr;
+  static ObIFTDict *global_dict_stop = nullptr;
+  static std::once_flag dict_init_flag;
 
-  ObFTDictDesc stopword_dict_desc("stopword",
-                                  ObFTDictType::DICT_IK_STOP,
-                                  ObCharsetType::CHARSET_UTF8MB4,
-                                  ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  std::call_once(dict_init_flag, [&]() {
+    if (OB_SUCCESS == init_single_dict(main_dict_desc, global_cache_main) &&
+        OB_SUCCESS == init_single_dict(quan_dict_desc, global_cache_quan) &&
+        OB_SUCCESS == init_single_dict(stopword_dict_desc, global_cache_stop)) {
+      
+      global_dict_main = OB_NEWx(ObFTRangeDict, &global_dict_alloc, global_dict_alloc, &global_cache_main, main_dict_desc);
+      global_dict_quan = OB_NEWx(ObFTRangeDict, &global_dict_alloc, global_dict_alloc, &global_cache_quan, quan_dict_desc);
+      global_dict_stop = OB_NEWx(ObFTRangeDict, &global_dict_alloc, global_dict_alloc, &global_cache_stop, stopword_dict_desc);
 
-  if (should_read_newest_table()) {
-    // clear dict cache, always false now
-  } else {
-    if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
-    } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
-    } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
+      if (OB_NOT_NULL(global_dict_main) && OB_NOT_NULL(global_dict_quan) && OB_NOT_NULL(global_dict_stop)) {
+          global_dict_main->init();
+          global_dict_quan->init();
+          global_dict_stop->init();
+      }
     }
-  }
+  });
 
-  if (OB_FAIL(ret)) {
-    // already logged.
-  } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
-  } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+  if (nullptr == global_dict_main || nullptr == global_dict_quan || nullptr == global_dict_stop) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    dict_main_ = global_dict_main;
+    dict_quan_ = global_dict_quan;
+    dict_stop_ = global_dict_stop;
   }
 
   return ret;
@@ -349,6 +354,7 @@ void ObIKFTParser::reset()
   if (!OB_ISNULL(ctx_)) {
     ctx_->~TokenizeContext();
     allocator_.free(ctx_);
+    ctx_ = nullptr;
   }
 
   for (ObIIKProcessor *segmenter : segmenters_) {
@@ -362,21 +368,11 @@ void ObIKFTParser::reset()
   cache_main_.reset();
   cache_quan_.reset();
   cache_stop_.reset();
-
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
-  }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
-  }
-
-  is_inited_ = false;
+  
+  // 全局字典，不再释放
+  dict_main_ = nullptr;
+  dict_quan_ = nullptr;
+  dict_stop_ = nullptr;
 }
 
 bool ObIKFTParser::should_read_newest_table() const { return false; }
