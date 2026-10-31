@@ -8467,6 +8467,30 @@ COPY '(' select_stmt ')' TO STRING_VALUE
     $$->children_[PARSE_SELECT_INTO_EXTRA] = into_outfile;
   }
 }
+| COPY '(' select_stmt ')' TO STRING_VALUE '(' NAME_OB NAME_OB opt_comma NAME_OB opt_comma NAME_OB STRING_VALUE ')'
+{
+  (void)$8; (void)$9; (void)$10; (void)$11; (void)$12; (void)$13; (void)$14;
+  // DuckDB_options_fallback
+  $$ = $3;
+  ParseNode *type_str = NULL;
+  ParseNode *type_node = NULL;
+  ParseNode *into_outfile = NULL;
+  ParseNode *format_node = NULL;
+  make_name_node(type_str, result->malloc_pool_, "csv");
+  malloc_non_terminal_node(type_node, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT_TYPE, 1, type_str);
+  malloc_non_terminal_node(format_node, result->malloc_pool_,
+                           T_EXTERNAL_FILE_FORMAT, 1, type_node);
+  malloc_non_terminal_node(into_outfile, result->malloc_pool_,
+                           T_INTO_OUTFILE, 3, $6, format_node, NULL);
+  if (NULL != $$->children_[PARSE_SELECT_INTO]
+      || NULL != $$->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "COPY target conflicts with existing INTO clause");
+    YYERROR;
+  } else {
+    $$->children_[PARSE_SELECT_INTO_EXTRA] = into_outfile;
+  }
+}
 ;
 
 select_stmt:

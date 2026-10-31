@@ -9919,8 +9919,10 @@ static struct VarsInit{
       ObSysVars[719].default_value_ = "0" ;
       ObSysVars[719].base_value_ = "0" ;
       ObSysVars[719].data_type_ = ObIntType ;
-      ObSysVars[719].info_ = "Enable file SQL (read_csv/read_json/read_parquet)" ;
+      ObSysVars[719].info_ = "Enable file sql" ;
       ObSysVars[719].flags_ = ObSysVarFlag::GLOBAL_SCOPE | ObSysVarFlag::SESSION_SCOPE | ObSysVarFlag::NEED_SERIALIZE ;
+      ObSysVars[719].min_val_ = "0" ;
+      ObSysVars[719].max_val_ = "1" ;
     ObSysVars[719].alias_ = "OB_SV_ENABLE_FILE_SQL" ;
     }();
 
