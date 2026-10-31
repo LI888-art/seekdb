@@ -96,9 +96,9 @@ void ObTextRetrievalTokenIter::reset()
 
 void ObTextRetrievalTokenIter::reuse()
 {
-  if (inv_idx_agg_cache_mode_ && !inv_idx_agg_param_->need_switch_param_) {
-    // do nothing
-  } else {
+  // 优化：如果参数没有切换（还是同一个 token 在重扫），保留之前的估算结果，
+  // 避免反复调用底层极其耗时的 estimate_row_count。
+  if (inv_idx_agg_param_->need_switch_param_) {
     token_doc_cnt_calculated_ = false;
   }
 }
