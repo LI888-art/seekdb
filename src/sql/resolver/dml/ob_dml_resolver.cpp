@@ -14865,7 +14865,6 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &table_node, TableItem 
   // 5. 读整个文件 + CSV 状态机解析（支持引号、字段内换行、转义引号）
   std::vector<std::string> columns;
   std::vector<std::vector<std::string>> data_rows;
-  const int64_t MAX_PREVIEW_ROWS = 1000;
   std::vector<CsvInferredType> col_types;
   size_t csv_data_start = 1;
   if (OB_SUCC(ret)) {
@@ -14948,8 +14947,7 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &table_node, TableItem 
       }
       if (OB_SUCC(ret)) {
         col_types.assign(columns.size(), CsvInferredType::UNKNOWN);
-        for (size_t i = csv_data_start; i < all_rows.size()
-             && static_cast<int64_t>(data_rows.size()) < MAX_PREVIEW_ROWS; ++i) {
+        for (size_t i = csv_data_start; i < all_rows.size(); ++i) {
           if (all_rows[i].size() != columns.size()) {
             LOG_WARN("read_csv: column count mismatch, skip bad row",
                      K(all_rows[i].size()), K(columns.size()));
