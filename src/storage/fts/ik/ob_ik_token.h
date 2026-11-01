@@ -135,6 +135,8 @@ private:
   int min_offset_ = -1;
   int max_offset_ = -1;
   int payload_ = -1;
+  mutable int64_t cached_p_weight_ = 0;
+  mutable int64_t cached_x_weight_ = 0;
   ObFTSortList list_;
 };
 

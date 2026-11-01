@@ -64,12 +64,12 @@ int ObIKTokenChain::add_token_if_conflict(const ObIKToken &token, bool &added)
   int ret = OB_SUCCESS;
   added = true;
   if (list_.is_empty()) {
-    list_.add_token(token);
+    list_.add_token(token); cached_p_weight_ = 0; cached_x_weight_ = 0;
     min_offset_ = token.offset_;
     max_offset_ = token.offset_ + token.length_;
     payload_ = token.length_;
   } else if (check_conflict(token)) {
-    list_.add_token(token);
+    list_.add_token(token); cached_p_weight_ = 0; cached_x_weight_ = 0;
     if (token.offset_ + token.length_ > max_offset_) {
       max_offset_ = token.offset_ + token.length_;
     }
@@ -85,14 +85,14 @@ int ObIKTokenChain::add_token_if_no_conflict(const ObIKToken &token, bool &added
   int ret = OB_SUCCESS;
   added = true;
   if (list_.is_empty()) {
-    list_.add_token(token);
+    list_.add_token(token); cached_p_weight_ = 0; cached_x_weight_ = 0;
     min_offset_ = token.offset_;
     max_offset_ = token.offset_ + token.length_;
     payload_ = token.length_;
   } else if (check_conflict(token)) {
     added = false;
   } else {
-    list_.add_token(token);
+    list_.add_token(token); cached_p_weight_ = 0; cached_x_weight_ = 0;
     min_offset_ = list_.min();
     max_offset_ = list_.max();
     payload_ += token.length_;
@@ -173,20 +173,24 @@ int ObIKTokenChain::copy(ObIKTokenChain *other)
 
 int64_t ObIKTokenChain::p_weight() const
 {
+  if (cached_p_weight_ > 0) return cached_p_weight_;
   int64_t p_weight = 0;
   int p = 0;
   for (const ObIKToken &token : list_.tokens()) {
     p++;
     p_weight += p * token.char_cnt_;
   }
+  cached_p_weight_ = p_weight;
   return p_weight;
 }
 int64_t ObIKTokenChain::x_weight() const
 {
+  if (cached_x_weight_ > 0) return cached_x_weight_;
   int64_t product = 1;
   for (const ObIKToken &token : list_.tokens()) {
     product *= token.char_cnt_;
   }
+  cached_x_weight_ = product;
   return product;
 }
 
