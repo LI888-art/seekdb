@@ -14498,6 +14498,13 @@ int ObDMLResolver::resolve_read_csv_item(const ParseNode &table_node, TableItem 
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("read_csv expression param mismatch", K(ret), K(table_node.num_child_));
   } else {
+    bool enable_file_sql = false;
+    if (OB_FAIL(session_info_->get_enable_file_sql(enable_file_sql))) {
+      LOG_WARN("failed to get enable_file_sql", K(ret));
+    } else if (!enable_file_sql) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "file sql is disabled, set enable_file_sql = ON first");
+    }
     func_name_node = table_node.children_[0];
     path_node = table_node.children_[1];
     if (3 == table_node.num_child_) {
