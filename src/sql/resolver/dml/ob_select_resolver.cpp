@@ -3022,6 +3022,8 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
                                      ? ObCharset::get_default_collation(external_format.csv_format_.cs_type_)
                                      : ObCharset::get_system_collation();
       if (OB_FAIL(external_format.csv_format_.init_format(ObDataInFileStruct(), 0, file_cs_type))) {
+      } else {
+        external_format.csv_format_.parse_header_ = true; // 强制导出表头
       }
     }
     for (int i = 0; OB_SUCC(ret) && i < format_node->num_child_; ++i) {

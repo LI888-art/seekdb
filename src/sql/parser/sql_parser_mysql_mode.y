@@ -383,6 +383,7 @@ END_P SET_VAR DELIMITER
 %type <node> date_unit date_params timestamp_params
 %type <node> drop_table_stmt table_list drop_view_stmt table_or_tables
 %type <node> explain_stmt explainable_stmt format_name kill_stmt create_outline_stmt alter_outline_stmt drop_outline_stmt opt_outline_target
+%type <node> copy_stmt opt_copy_format copy_format_opt_list copy_format_opt
 %type <node> expr_list expr expr_const conf_const simple_expr simple_expr_list expr_or_default bit_expr bool_pri predicate explain_or_desc pl_expr_stmt
 %type <node> column_ref multi_delete_table
 %type <node> case_expr func_expr in_expr sub_query_flag search_expr
@@ -553,8 +554,53 @@ opt_end_p:
 ;
 
 /* only preparable statement will set question mark size */
+copy_stmt:
+    COPY '(' select_stmt ')' TO STRING_VALUE opt_copy_format
+    {
+      (void)($7);
+      $$ = $3;
+      ParseNode *format_type_str = NULL;
+      ParseNode *format_type_node = NULL;
+      ParseNode *format_list = NULL;
+      ParseNode *into_node = NULL;
+
+      malloc_terminal_node(format_type_str, result->malloc_pool_, T_VARCHAR);
+      format_type_str->str_value_ = "csv";
+      format_type_str->str_len_ = 3;
+
+      malloc_non_terminal_node(format_type_node, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, format_type_str);
+      malloc_non_terminal_node(format_list, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT, 1, format_type_node);
+      
+      // 3个参数表示带有 format 结构
+      malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3, $6, format_list, NULL);
+      if (NULL != into_node && NULL != $$) {
+        $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+      }
+    }
+    ;
+
+opt_copy_format:
+    /* empty */ { $$ = NULL; }
+    | '(' copy_format_opt_list ')' { $$ = NULL; (void)($2); }
+    ;
+
+copy_format_opt_list:
+    copy_format_opt { $$ = NULL; (void)($1); }
+    | copy_format_opt_list ',' copy_format_opt { $$ = NULL; (void)($1); (void)($3); }
+    ;
+
+copy_format_opt:
+    NAME_OB { $$ = NULL; (void)($1); }
+    | FORMAT NAME_OB { $$ = NULL; (void)($2); }
+    | NAME_OB NAME_OB { $$ = NULL; (void)($1); (void)($2); }
+    | NAME_OB STRING_VALUE { $$ = NULL; (void)($1); (void)($2); }
+    | NAME_OB COMP_EQ expr_const { $$ = NULL; (void)($1); (void)($3); }
+    | STRING_VALUE { $$ = NULL; (void)($1); }
+    ;
+
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; check_question_mark($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;

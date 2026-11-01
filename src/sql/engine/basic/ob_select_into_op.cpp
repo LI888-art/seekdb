@@ -121,6 +121,9 @@ void ObSelectIntoOp::set_csv_format_options()
   if (MY_SPEC.external_properties_.str_.empty()) {
     field_str_ = MY_SPEC.field_str_;
     line_str_ = MY_SPEC.line_str_;
+    field_str_.set_varchar(",");
+    line_str_.set_varchar("\n");
+    has_written_header_ = false;
     has_enclose_ = MY_SPEC.closed_cht_.get_val_len() > 0;
     char_enclose_ = has_enclose_ ? MY_SPEC.closed_cht_.get_char().ptr()[0] : 0;
     is_optional_ = MY_SPEC.is_optional_;
@@ -130,10 +133,11 @@ void ObSelectIntoOp::set_csv_format_options()
   } else {
     is_optional_ = external_properties_.csv_format_.is_optional_;
     cs_type_ = ObCharset::get_default_collation(external_properties_.csv_format_.cs_type_);
-    field_str_.set_varchar(external_properties_.csv_format_.field_term_str_);
+    field_str_.set_varchar(",");
     field_str_.set_collation_type(cs_type_);
-    line_str_.set_varchar(external_properties_.csv_format_.line_term_str_);
+    line_str_.set_varchar("\n");
     line_str_.set_collation_type(cs_type_);
+    has_written_header_ = false;
     if (external_properties_.csv_format_.field_enclosed_char_ == INT64_MAX) { // null
       has_enclose_ = false;
       char_enclose_ = 0;
@@ -996,6 +1000,28 @@ int ObSelectIntoOp::into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFil
     if (OB_FAIL(select_exprs.at(i)->eval_batch(eval_ctx_, *brs.skip_, brs.size_))) {
     } else if (OB_FAIL(datum_vectors.push_back(select_exprs.at(i)->locate_expr_datumvector(eval_ctx_)))) {
     }
+  }
+  if (!has_written_header_ && OB_NOT_NULL(data_writer)) {
+    csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer);
+    const ObSelectStmt *select_stmt = NULL;
+    if (OB_NOT_NULL(ctx_.get_sql_ctx()) && OB_NOT_NULL(ctx_.get_sql_ctx()->cur_stmt_)) {
+      select_stmt = dynamic_cast<const ObSelectStmt*>(ctx_.get_sql_ctx()->cur_stmt_);
+    }
+    if (OB_NOT_NULL(select_stmt)) {
+      for (int64_t col_idx = 0; OB_SUCC(ret) && col_idx < select_stmt->get_select_item_size(); ++col_idx) {
+        ObObj name_obj;
+        name_obj.set_varchar(select_stmt->get_select_item(col_idx).alias_name_);
+        name_obj.set_collation_type(cs_type_);
+        OZ(write_obj_to_file(name_obj, *csv_data_writer));
+        if (col_idx < select_stmt->get_select_item_size() - 1) {
+          char comma_char = ',';
+          OZ(write_single_char_to_file(&comma_char, *csv_data_writer));
+        }
+      }
+      char newline_char = '\n';
+      OZ(write_single_char_to_file(&newline_char, *csv_data_writer));
+    }
+    has_written_header_ = true;
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < brs.size_; ++i) {
     if (brs.skip_->contain(i)) {

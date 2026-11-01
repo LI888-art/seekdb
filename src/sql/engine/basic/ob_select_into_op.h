@@ -278,6 +278,7 @@ private:
   bool is_optional_;
   bool has_escape_;
   bool has_lob_;
+  bool has_written_header_;
   bool has_json_;
   bool has_coll_;
   common::ObObjPrintParams print_params_;
