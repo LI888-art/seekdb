@@ -8627,6 +8627,14 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
             LOG_WARN("failed to set ai physical column name in alter", K(ret));
           } else if (OB_FAIL(new_table_schema.add_column(physical_col))) {
             LOG_WARN("failed to add ai physical column in alter", K(ret));
+          } else {
+            ObColumnSchemaV2 *added_col = new_table_schema.get_column_schema(ai_col.column_id_);
+            if (OB_ISNULL(added_col)) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("failed to get added ai physical column", K(ret), K(ai_col.column_id_));
+            } else if (OB_FAIL(ddl_operator.insert_single_column(trans, new_table_schema, *added_col))) {
+              LOG_WARN("failed to persist ai physical column in alter", K(ret));
+            }
           }
         }
       }
