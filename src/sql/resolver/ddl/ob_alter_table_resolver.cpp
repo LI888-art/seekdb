@@ -848,9 +848,9 @@ int ObAlterTableResolver::resolve_column_options(const ParseNode &node,
               } else {
                 ObString col_name(name_node->str_len_, name_node->str_value_);
                 ai_col.column_id_ = table_schema_->get_max_used_column_id() + 1;
-                ai_col.state_column_id_ = ai_col.column_id_ + 10000;
-                ai_col.request_column_id_ = ai_col.column_id_ + 10001;
-                ai_col.result_spec_column_id_ = ai_col.column_id_ + 10002;
+                ai_col.state_column_id_ = ai_col.column_id_ * 10;
+                ai_col.request_column_id_ = ai_col.column_id_ * 10 + 1;
+                ai_col.result_spec_column_id_ = ai_col.column_id_ * 10 + 2;
                 ai_col.max_retries_ = 2;
                 ai_col.strict_read_ = false;
                 ai_col.ai_model_name_ = ObString::make_string("mock");

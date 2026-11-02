@@ -8607,8 +8607,27 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
     // AI COLUMN: move new AI columns to new_table_schema and persist to __all_ai_column
     if (OB_SUCC(ret) && alter_table_schema.get_ai_column_count() > 0) {
       for (int64_t ai_i = 0; OB_SUCC(ret) && ai_i < alter_table_schema.get_ai_column_count(); ++ai_i) {
-        if (OB_FAIL(new_table_schema.add_ai_column_copy(alter_table_schema.get_ai_columns().at(ai_i)))) {
+        const ObAIColumnSchema &ai_col = alter_table_schema.get_ai_columns().at(ai_i);
+        if (OB_FAIL(new_table_schema.add_ai_column_copy(ai_col))) {
           LOG_WARN("failed to add ai column to new_table_schema", K(ret));
+        } else {
+          ObColumnSchemaV2 physical_col;
+          ObCharsetType charset = new_table_schema.get_charset_type();
+          ObCollationType collation = CS_TYPE_UTF8MB4_GENERAL_CI;
+          if (CHARSET_INVALID == charset || CHARSET_BINARY == charset) {
+            charset = CHARSET_UTF8MB4;
+          }
+          physical_col.set_column_id(ai_col.column_id_);
+          physical_col.set_data_type(ObLongTextType);
+          physical_col.set_nullable(true);
+          physical_col.set_charset_type(charset);
+          physical_col.set_collation_type(collation);
+          physical_col.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObLongTextType]);
+          if (OB_FAIL(physical_col.set_column_name(ai_col.column_name_))) {
+            LOG_WARN("failed to set ai physical column name in alter", K(ret));
+          } else if (OB_FAIL(new_table_schema.add_column(physical_col))) {
+            LOG_WARN("failed to add ai physical column in alter", K(ret));
+          }
         }
       }
       if (OB_SUCC(ret)) {

@@ -890,9 +890,9 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
           } else {
             ObString col_name(name_node->str_len_, name_node->str_value_);
             ai_col.column_id_ = gen_column_id();
-            ai_col.state_column_id_ = ai_col.column_id_ + 10000;
-            ai_col.request_column_id_ = ai_col.column_id_ + 10001;
-            ai_col.result_spec_column_id_ = ai_col.column_id_ + 10002;
+            ai_col.state_column_id_ = ai_col.column_id_ * 10;
+            ai_col.request_column_id_ = ai_col.column_id_ * 10 + 1;
+            ai_col.result_spec_column_id_ = ai_col.column_id_ * 10 + 2;
             ai_col.max_retries_ = 2;
             ai_col.strict_read_ = false;
             ai_col.ai_model_name_ = ObString::make_string("mock");
@@ -902,6 +902,31 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
               SQL_RESV_LOG(WARN, "failed to copy ai column name", K(ret));
             } else if (OB_FAIL(table_schema.add_ai_column(ai_col))) {
               SQL_RESV_LOG(WARN, "failed to add ai column to table schema", K(ret));
+            } else {
+              ObColumnSchemaV2 physical_col;
+              ObCharsetType charset = table_schema.get_charset_type();
+              ObCollationType collation = CS_TYPE_UTF8MB4_GENERAL_CI;
+              if (CHARSET_INVALID == charset || CHARSET_BINARY == charset) {
+                charset = CHARSET_UTF8MB4;
+              }
+              if (OB_NOT_NULL(session_info_)) {
+                ObCollationType sess_coll = CS_TYPE_INVALID;
+                if (OB_SUCC(session_info_->get_collation_connection(sess_coll))
+                    && CS_TYPE_INVALID != sess_coll) {
+                  collation = sess_coll;
+                }
+              }
+              physical_col.set_column_id(ai_col.column_id_);
+              physical_col.set_data_type(ObLongTextType);
+              physical_col.set_nullable(true);
+              physical_col.set_charset_type(charset);
+              physical_col.set_collation_type(collation);
+              physical_col.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObLongTextType]);
+              if (OB_FAIL(physical_col.set_column_name(col_name))) {
+                SQL_RESV_LOG(WARN, "failed to set ai physical column name", K(ret));
+              } else if (OB_FAIL(table_schema.add_column(physical_col))) {
+                SQL_RESV_LOG(WARN, "failed to add ai physical column", K(ret));
+              }
             }
           }
         }
