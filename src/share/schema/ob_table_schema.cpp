@@ -1175,6 +1175,28 @@ void ObTableSchema::reset_column_part_key_info()
   }
 }
 
+int ObTableSchema::add_ai_column_copy(const ObAIColumnSchema &src)
+{
+  int ret = OB_SUCCESS;
+  ObAIColumnSchema dst;
+  dst.column_id_ = src.column_id_;
+  dst.state_column_id_ = src.state_column_id_;
+  dst.request_column_id_ = src.request_column_id_;
+  dst.result_spec_column_id_ = src.result_spec_column_id_;
+  dst.max_retries_ = src.max_retries_;
+  dst.strict_read_ = src.strict_read_;
+  if (OB_ISNULL(allocator_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SHARE_LOG(WARN, "allocator is null", K(ret));
+  } else if (OB_FAIL(ob_write_string(*allocator_, src.column_name_, dst.column_name_))) {
+  } else if (OB_FAIL(ob_write_string(*allocator_, src.ai_model_name_, dst.ai_model_name_))) {
+  } else if (OB_FAIL(ob_write_string(*allocator_, src.normalized_expr_, dst.normalized_expr_))) {
+  } else if (OB_FAIL(ob_write_string(*allocator_, src.sync_mode_, dst.sync_mode_))) {
+  } else if (OB_FAIL(ai_columns_.push_back(dst))) {
+  }
+  return ret;
+}
+
 int ObTableSchema::assign(const ObTableSchema &src_schema)
 {
   int ret = OB_SUCCESS;

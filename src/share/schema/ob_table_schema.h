@@ -1268,6 +1268,7 @@ public:
   int check_functional_index_columns_depend(const ObColumnSchemaV2 &data_column_schema, ObSchemaGetterGuard &schema_guard, bool &has_prefix_idx_col_deps) const;
   int check_column_has_multivalue_index_depend(const ObColumnSchemaV2 &data_column_schema, bool &has_func_idx_col_deps) const;
   int add_ai_column(const ObAIColumnSchema &ai_col) { return ai_columns_.push_back(ai_col); }
+  int add_ai_column_copy(const ObAIColumnSchema &src);
   const common::ObIArray<ObAIColumnSchema> &get_ai_columns() const { return ai_columns_; }
   int64_t get_ai_column_count() const { return ai_columns_.count(); }
 

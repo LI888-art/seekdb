@@ -830,8 +830,40 @@ int ObAlterTableResolver::resolve_column_options(const ParseNode &node,
           break;
         }
         case T_AI_COLUMN_ADD: {
-          ret = OB_NOT_SUPPORTED;
-          SQL_RESV_LOG(WARN, "AI COLUMN is not supported yet", K(ret));
+          ObAIColumnSchema ai_col;
+          if (OB_UNLIKELY(1 != column_node->num_child_ || OB_ISNULL(column_node->children_))) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_RESV_LOG(WARN, "invalid AI COLUMN ADD node", K(ret));
+          } else {
+            ParseNode *def_node = column_node->children_[0];
+            if (OB_ISNULL(def_node) || OB_UNLIKELY(T_AI_COLUMN_DEFINITION != def_node->type_)
+                || OB_UNLIKELY(2 != def_node->num_child_) || OB_ISNULL(def_node->children_)) {
+              ret = OB_ERR_UNEXPECTED;
+              SQL_RESV_LOG(WARN, "invalid AI COLUMN definition node", K(ret));
+            } else {
+              ParseNode *name_node = def_node->children_[0];
+              if (OB_ISNULL(name_node) || OB_ISNULL(name_node->str_value_) || name_node->str_len_ <= 0) {
+                ret = OB_ERR_UNEXPECTED;
+                SQL_RESV_LOG(WARN, "invalid AI COLUMN name node", K(ret));
+              } else {
+                ObString col_name(name_node->str_len_, name_node->str_value_);
+                ai_col.column_id_ = table_schema_->get_max_used_column_id() + 1;
+                ai_col.state_column_id_ = ai_col.column_id_ + 10000;
+                ai_col.request_column_id_ = ai_col.column_id_ + 10001;
+                ai_col.result_spec_column_id_ = ai_col.column_id_ + 10002;
+                ai_col.max_retries_ = 2;
+                ai_col.strict_read_ = false;
+                ai_col.ai_model_name_ = ObString::make_string("mock");
+                ai_col.sync_mode_ = ObString::make_string("async");
+                ai_col.normalized_expr_ = ObString::make_string("AI_COLUMN_EXPR");
+                if (OB_FAIL(ob_write_string(*allocator_, col_name, ai_col.column_name_))) {
+                  SQL_RESV_LOG(WARN, "failed to copy ai column name", K(ret));
+                } else if (OB_FAIL(get_alter_table_stmt()->get_alter_table_schema().add_ai_column(ai_col))) {
+                  SQL_RESV_LOG(WARN, "failed to add ai column to alter table schema", K(ret));
+                }
+              }
+            }
+          }
           break;
         }
         default:{

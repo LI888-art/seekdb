@@ -8603,6 +8603,29 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
       if (OB_FAIL(ObDDLLock::lock_for_common_ddl_in_trans(new_table_schema, require_strict_binary_format, trans))) {
       }
     }
+
+    // AI COLUMN: move new AI columns to new_table_schema and persist to __all_ai_column
+    if (OB_SUCC(ret) && alter_table_schema.get_ai_column_count() > 0) {
+      for (int64_t ai_i = 0; OB_SUCC(ret) && ai_i < alter_table_schema.get_ai_column_count(); ++ai_i) {
+        if (OB_FAIL(new_table_schema.add_ai_column_copy(alter_table_schema.get_ai_columns().at(ai_i)))) {
+          LOG_WARN("failed to add ai column to new_table_schema", K(ret));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ObSchemaService *schema_service = NULL;
+        if (OB_ISNULL(schema_service_)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_ISNULL(schema_service = schema_service_->get_schema_service())) {
+          ret = OB_ERR_SYS;
+          LOG_WARN("schema_service must not null", K(ret));
+        } else {
+          ObTableSqlService &sql_service = schema_service->get_table_sql_service();
+          if (OB_FAIL(sql_service.add_ai_columns(trans, new_table_schema))) {
+            LOG_WARN("failed to add ai columns in alter_table_column", K(ret));
+          }
+        }
+      }
+    }
   }
 
   return ret;
