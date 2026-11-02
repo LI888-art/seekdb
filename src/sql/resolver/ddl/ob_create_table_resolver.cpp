@@ -877,6 +877,10 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         }
       } else if (T_EMPTY == element->type_) {
         // compatible with mysql 5.7 check (expr), do nothing
+      } else if (T_AI_COLUMN_DEFINITION == element->type_) {
+        // TODO: 正式实现 AI 列 resolve，先返回明确错误
+        ret = OB_NOT_SUPPORTED;
+        SQL_RESV_LOG(WARN, "AI COLUMN is not supported yet", K(ret));
       } else {
         // won't be here
         ret = OB_ERR_UNEXPECTED;

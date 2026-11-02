@@ -394,7 +394,7 @@ END_P SET_VAR DELIMITER
 %type <ival> opt_hash_sort_and_pushdown opts_hash_sort_and_pushdown
 %type <node> update_asgn_list update_asgn_factor
 %type <node> update_basic_stmt delete_basic_stmt
-%type <node> table_element_list table_element column_definition column_definition_ref column_definition_list column_name_list
+%type <node> table_element_list table_element column_definition column_definition_ref column_definition_list column_name_list ai_column_definition
 %type <node> opt_generated_keyname opt_generated_option_list opt_generated_column_attribute_list generated_column_attribute opt_storage_type
 %type <node> data_type special_table_type opt_if_not_exists opt_if_exists opt_charset collation opt_collation cast_data_type
 %type <node> replace_with_opt_hint insert_with_opt_hint column_list opt_on_duplicate_key_clause opt_into opt_replace opt_temporary no_param_column_ref
@@ -4680,8 +4680,19 @@ table_element
 }
 ;
 
+ai_column_definition:
+AI COLUMN column_name AS func_expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_DEFINITION, 2, $3, $5);
+}
+;
+
 table_element:
 column_definition
+{
+  $$ = $1;
+}
+| ai_column_definition
 {
   $$ = $1;
 }
@@ -15246,6 +15257,12 @@ ADD COLUMN column_definition
 {
   (void)($2); /* make bison mute */
   malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_ADD, 1, $3);
+}
+| ADD AI COLUMN column_name AS func_expr
+{
+  ParseNode *ai_col_node = NULL;
+  malloc_non_terminal_node(ai_col_node, result->malloc_pool_, T_AI_COLUMN_DEFINITION, 2, $4, $6);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_ADD, 1, ai_col_node);
 }
 | ADD column_definition
 {

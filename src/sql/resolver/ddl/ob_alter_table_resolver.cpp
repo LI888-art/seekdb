@@ -829,6 +829,11 @@ int ObAlterTableResolver::resolve_column_options(const ParseNode &node,
           }
           break;
         }
+        case T_AI_COLUMN_ADD: {
+          ret = OB_NOT_SUPPORTED;
+          SQL_RESV_LOG(WARN, "AI COLUMN is not supported yet", K(ret));
+          break;
+        }
         default:{
             ret = OB_ERR_UNEXPECTED;
             SQL_RESV_LOG(WARN, "Unknown column option type!",
