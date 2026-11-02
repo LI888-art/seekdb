@@ -383,7 +383,6 @@ END_P SET_VAR DELIMITER
 %type <node> date_unit date_params timestamp_params
 %type <node> drop_table_stmt table_list drop_view_stmt table_or_tables
 %type <node> explain_stmt explainable_stmt format_name kill_stmt create_outline_stmt alter_outline_stmt drop_outline_stmt opt_outline_target
-%type <node> opt_ai_column_options ai_column_options
 %type <node> copy_stmt opt_copy_format copy_format_opt_list copy_format_opt
 %type <node> expr_list expr expr_const conf_const simple_expr simple_expr_list expr_or_default bit_expr bool_pri predicate explain_or_desc pl_expr_stmt
 %type <node> column_ref multi_delete_table
@@ -6195,44 +6194,8 @@ column_attribute_list column_attribute
   $$ = $1;
 }
 
-opt_ai_column_options:
-/*EMPTY*/ { $$ = NULL; }
-| WITH '(' ai_column_options ')' { $$ = $3; }
-;
-
-ai_column_options:
-NAME_OB COMP_EQ expr_const
-{
-  (void)($1);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 1, $3);
-}
-| ai_column_options ',' NAME_OB COMP_EQ expr_const
-{
-  (void)($3);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $5);
-}
-;
-
 column_attribute:
-AI COLUMN '(' expr ')' opt_ai_column_options
-{
-  (void)($4); (void)($6);
-  
-  // 直接截取原 SQL 字符串的指针，不需要手动 alloc
-  ParseNode *comment_str = NULL;
-  malloc_terminal_node(comment_str, result->malloc_pool_, T_VARCHAR);
-  if (comment_str != NULL) {
-    const char *sql_ptr = result->input_sql_;
-    int64_t start = @1.first_column - 1;
-    int64_t end = @6.last_column - 1;
-    int64_t len = end - start + 1;
-    
-    comment_str->str_value_ = (char *)sql_ptr + start;
-    comment_str->str_len_ = (int32_t)len;
-  }
-  malloc_non_terminal_node($$, result->malloc_pool_, T_COMMENT, 1, comment_str);
-}
-| not NULLX
+not NULLX
 {
   (void)($1) ;
   (void)($2) ; /* make bison mute */
@@ -12722,13 +12685,7 @@ CLASS_ORIGIN
  *
  *****************************************************************************/
 show_stmt:
-SHOW AI COLUMNS FROM relation_factor
-{
-  malloc_terminal_node($$, result->malloc_pool_, T_INT);
-  $$->value_ = 0;
-  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $5, NULL, NULL);
-}
-| SHOW opt_extended_or_full TABLES opt_from_or_in_database_clause opt_show_condition
+SHOW opt_extended_or_full TABLES opt_from_or_in_database_clause opt_show_condition
 {
   ParseNode *value = NULL;
   malloc_terminal_node(value, result->malloc_pool_, T_INT);

@@ -8606,22 +8606,6 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
   }
 
   return ret;
-
-  // Hook AI columns into ALTER TABLE flow
-  if (OB_SUCC(ret) && !is_core_table(new_table_schema.get_table_id())) {
-    ObSchemaService *schema_service = NULL;
-    if (OB_ISNULL(schema_service_)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_ISNULL(schema_service = schema_service_->get_schema_service())) {
-      ret = OB_ERR_SYS;
-      LOG_WARN("schema_service must not null", KR(ret));
-    } else {
-      ObTableSqlService &sql_service = schema_service->get_table_sql_service();
-      if (OB_FAIL(sql_service.add_ai_columns(trans, new_table_schema))) {
-        LOG_WARN("failed to add ai columns in alter_table_column", KR(ret));
-      }
-    }
-  }
 }
 
 int ObDDLService::create_aux_lob_table_if_need(ObTableSchema &data_table_schema,
