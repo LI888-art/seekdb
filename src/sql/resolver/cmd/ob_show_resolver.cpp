@@ -16,6 +16,9 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/cmd/ob_show_resolver.h"
+#include "common/sql_mode/ob_sql_mode.h"
+#include "lib/string/ob_sql_string.h"
+#include "share/schema/ob_schema_utils.h"
 #include "sql/resolver/dcl/ob_grant_resolver.h"
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/resolver/cmd/ob_show_table_status_sql.h"
@@ -150,7 +153,8 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_ENGINE)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_OPEN_TABLES)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CREATE_USER)
-            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)) {
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_AI_COLUMNS)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     real_id = 1;
@@ -180,6 +184,38 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
     stmt_need_privs.need_privs_.set_allocator(&alloc);
     ObSqlStrGenerator sql_gen;
     switch (parse_tree.type_) {
+      case T_SHOW_AI_COLUMNS: {
+        if (OB_UNLIKELY(parse_tree.num_child_ != 1 || NULL == parse_tree.children_)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ObString show_db_name;
+          uint64_t show_db_id = OB_INVALID_ID;
+          ObString show_table_name;
+          uint64_t show_table_id = OB_INVALID_ID;
+          bool is_view = false;
+          show_resv_ctx.stmt_type_ = stmt::T_SHOW_COLUMNS;
+          if (OB_FAIL(resolve_show_from_table(parse_tree.children_[0], NULL,
+                                              database_name.empty(), T_SHOW_COLUMNS, real_id,
+                                              show_db_name, show_db_id, show_table_name,
+                                              show_table_id, is_view))) {
+            LOG_WARN("failed to resolve show ai columns table", K(ret));
+          } else {
+            ObSqlString ai_sql;
+            if (OB_FAIL(ai_sql.append_fmt(
+                "SELECT column_name, ai_model_name, state_column_id, request_column_id, "
+                "result_spec_column_id, normalized_expr, max_retries, sync_mode "
+                "FROM oceanbase.__all_ai_column WHERE table_id = %lu AND column_id > 0",
+                share::schema::ObSchemaUtils::get_extract_schema_id(show_table_id)))) {
+              LOG_WARN("failed to build show ai columns sql", K(ret));
+            } else if (OB_FAIL(ob_write_string(*params_.allocator_,
+                                               ObString(ai_sql.length(), ai_sql.ptr()),
+                                               select_sql))) {
+              LOG_WARN("failed to copy show ai columns sql", K(ret));
+            }
+          }
+        }
+        break;
+      }
       case T_SHOW_TABLES: {
         if (OB_UNLIKELY(parse_tree.num_child_ != 3 || NULL == parse_tree.children_)) {
           ret = OB_ERR_UNEXPECTED;

@@ -12685,7 +12685,12 @@ CLASS_ORIGIN
  *
  *****************************************************************************/
 show_stmt:
-SHOW opt_extended_or_full TABLES opt_from_or_in_database_clause opt_show_condition
+SHOW AI COLUMNS FROM relation_factor
+{
+  (void)($1); (void)($2); (void)($3); (void)($4);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_AI_COLUMNS, 1, $5);
+}
+| SHOW opt_extended_or_full TABLES opt_from_or_in_database_clause opt_show_condition
 {
   ParseNode *value = NULL;
   malloc_terminal_node(value, result->malloc_pool_, T_INT);
