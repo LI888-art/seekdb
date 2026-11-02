@@ -934,6 +934,36 @@ protected:
   
 };
 
+struct ObAIColumnSchema
+{
+  uint64_t column_id_;
+  common::ObString column_name_;
+  common::ObString ai_model_name_;
+  common::ObString normalized_expr_;
+  int64_t state_column_id_;
+  int64_t request_column_id_;
+  int64_t result_spec_column_id_;
+  int64_t max_retries_;
+  common::ObString sync_mode_;
+  bool strict_read_;
+
+  ObAIColumnSchema()
+    : column_id_(common::OB_INVALID_ID),
+      column_name_(),
+      ai_model_name_(),
+      normalized_expr_(),
+      state_column_id_(common::OB_INVALID_ID),
+      request_column_id_(common::OB_INVALID_ID),
+      result_spec_column_id_(common::OB_INVALID_ID),
+      max_retries_(0),
+      sync_mode_(),
+      strict_read_(false)
+  {}
+  TO_STRING_KV(K_(column_id), K_(column_name), K_(ai_model_name), K_(normalized_expr),
+               K_(state_column_id), K_(request_column_id), K_(result_spec_column_id),
+               K_(max_retries), K_(sync_mode), K_(strict_read));
+};
+
 class ObTableSchema : public ObSimpleTableSchemaV2
 {
   OB_UNIS_VERSION(1);
@@ -1237,6 +1267,10 @@ public:
   int check_prefix_index_columns_depend(const ObColumnSchemaV2 &data_column_schema, ObSchemaGetterGuard &schema_guard, bool &has_prefix_idx_col_deps) const;
   int check_functional_index_columns_depend(const ObColumnSchemaV2 &data_column_schema, ObSchemaGetterGuard &schema_guard, bool &has_prefix_idx_col_deps) const;
   int check_column_has_multivalue_index_depend(const ObColumnSchemaV2 &data_column_schema, bool &has_func_idx_col_deps) const;
+  int add_ai_column(const ObAIColumnSchema &ai_col) { return ai_columns_.push_back(ai_col); }
+  const common::ObIArray<ObAIColumnSchema> &get_ai_columns() const { return ai_columns_; }
+  int64_t get_ai_column_count() const { return ai_columns_.count(); }
+
   int add_depend_table_id(uint64_t depend_table_id) { return depend_table_ids_.push_back(depend_table_id); }
   int add_depend_mock_fk_parent_table_id(uint64_t depend_table_id) { return depend_mock_fk_parent_table_ids_.push_back(depend_table_id); }
   const common::ObIArray<uint64_t>& get_depend_table_ids() const { return depend_table_ids_; }
@@ -1656,6 +1690,9 @@ protected:
   // exec_env
   common::ObString exec_env_;
   ObSemiStructEncodingType semistruct_encoding_type_;
+
+  // AI column definitions (transient, persisted to __all_ai_column, not in __all_table serialization)
+  common::ObSArray<ObAIColumnSchema> ai_columns_;
 };
 
 class ObPrintableTableSchema final : public ObTableSchema

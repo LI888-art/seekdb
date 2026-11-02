@@ -1146,7 +1146,8 @@ ObTableSchema::ObTableSchema(ObIAllocator *allocator)
     micro_index_clustered_(false),
     index_params_(),
     exec_env_(),
-    semistruct_encoding_type_()
+    semistruct_encoding_type_(),
+    ai_columns_(SCHEMA_SMALL_MALLOC_BLOCK_SIZE, ModulePageAllocator(*allocator))
 {
   reset();
 }
@@ -1233,6 +1234,25 @@ int ObTableSchema::assign(const ObTableSchema &src_schema)
       if (FAILEDx(reserved_table_ids_.assign(src_schema.reserved_table_ids_))) {
       }
 
+      ai_columns_.reset();
+      for (int64_t _ai_i = 0; OB_SUCC(ret) && _ai_i < src_schema.ai_columns_.count(); ++_ai_i) {
+        const ObAIColumnSchema &_src = src_schema.ai_columns_.at(_ai_i);
+        ObAIColumnSchema _dst;
+        _dst.column_id_ = _src.column_id_;
+        _dst.state_column_id_ = _src.state_column_id_;
+        _dst.request_column_id_ = _src.request_column_id_;
+        _dst.result_spec_column_id_ = _src.result_spec_column_id_;
+        _dst.max_retries_ = _src.max_retries_;
+        _dst.strict_read_ = _src.strict_read_;
+        if (OB_ISNULL(allocator_)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(ob_write_string(*allocator_, _src.column_name_, _dst.column_name_))) {
+        } else if (OB_FAIL(ob_write_string(*allocator_, _src.ai_model_name_, _dst.ai_model_name_))) {
+        } else if (OB_FAIL(ob_write_string(*allocator_, _src.normalized_expr_, _dst.normalized_expr_))) {
+        } else if (OB_FAIL(ob_write_string(*allocator_, _src.sync_mode_, _dst.sync_mode_))) {
+        } else if (OB_FAIL(ai_columns_.push_back(_dst))) {
+        }
+      }
       if (FAILEDx(depend_table_ids_.assign(src_schema.depend_table_ids_))) {
       }
 
@@ -2566,6 +2586,7 @@ void ObTableSchema::reset()
   reserved_table_ids_.reset();
 
   depend_table_ids_.reset();
+  ai_columns_.reset();
   depend_mock_fk_parent_table_ids_.reset();
 
   column_cnt_ = 0;
