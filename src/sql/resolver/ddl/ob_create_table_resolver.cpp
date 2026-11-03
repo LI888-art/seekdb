@@ -2385,6 +2385,33 @@ int ObCreateTableResolver::uk_or_heap_table_pk_add_to_index_list(ObArray<int> &i
 }
 }//end namespace sql
 
+static bool ai_expr_has_ai_column_ref(const ParseNode *node,
+                                      ObTableSchema &table_schema,
+                                      ObString &ref_name)
+{
+  bool found = false;
+  if (OB_ISNULL(node)) {
+    return false;
+  }
+  if (T_COLUMN_REF == node->type_ && node->num_child_ >= 3 && OB_NOT_NULL(node->children_[2])) {
+    const ParseNode *col_node = node->children_[2];
+    if (OB_NOT_NULL(col_node->str_value_) && col_node->str_len_ > 0) {
+      ObString name(col_node->str_len_, col_node->str_value_);
+      for (int64_t i = 0; i < table_schema.get_ai_column_count(); ++i) {
+        if (table_schema.get_ai_columns().at(i).column_name_ == name) {
+          found = true;
+          ref_name = name;
+          break;
+        }
+      }
+    }
+  }
+  for (int64_t i = 0; i < node->num_child_ && !found; ++i) {
+    found = ai_expr_has_ai_column_ref(node->children_[i], table_schema, ref_name);
+  }
+  return found;
+}
+
 int ObCreateTableResolver::resolve_ai_column_options(
     const ParseNode *node, ObAIColumnSchema &ai_col)
 {
@@ -2439,6 +2466,16 @@ int ObCreateTableResolver::resolve_ai_column_definition(
     const ParseNode *attr_node, const ObColumnSchemaV2 &column, ObTableSchema &table_schema)
 {
   int ret = OB_SUCCESS;
+  // reject AI column depending on another AI column
+  if (OB_NOT_NULL(attr_node) && attr_node->num_child_ == 2
+      && OB_NOT_NULL(attr_node->children_[0])) {
+    ObString ref_name;
+    if (ai_expr_has_ai_column_ref(attr_node->children_[0], table_schema, ref_name)) {
+      ret = OB_NOT_SUPPORTED;
+      SQL_RESV_LOG(WARN, "ai column depends on ai column", K(ret), K(ref_name));
+      return ret;
+    }
+  }
   if (OB_NOT_NULL(attr_node) && attr_node->num_child_ == 2
       && OB_NOT_NULL(attr_node->children_[0])) {
     const ParseNode *func_node = attr_node->children_[0];
