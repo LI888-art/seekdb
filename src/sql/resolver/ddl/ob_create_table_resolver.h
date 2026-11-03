@@ -78,6 +78,7 @@ private:
   int check_column_name_duplicate(const ParseNode *node);
   int resolve_primary_key_node(const ParseNode &pk_node, common::ObArray<ObColumnResolveStat> &stats);
   int resolve_ai_column_definition(const ParseNode *attr_node, const ObColumnSchemaV2 &column, ObTableSchema &table_schema);
+  int resolve_ai_column_options(const ParseNode *node, ObAIColumnSchema &ai_col);
   int resolve_table_elements(const ParseNode *node,
                              common::ObArray<int> &idx_index_node,
                              common::ObArray<int> &foreign_key_node_position_list,

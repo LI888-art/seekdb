@@ -2366,6 +2366,56 @@ int ObCreateTableResolver::uk_or_heap_table_pk_add_to_index_list(ObArray<int> &i
 }
 }//end namespace sql
 
+int ObCreateTableResolver::resolve_ai_column_options(
+    const ParseNode *node, ObAIColumnSchema &ai_col)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    // no WITH (...) options
+  } else if (T_LINK_NODE == node->type_ && 2 == node->num_child_) {
+    const ParseNode *left = node->children_[0];
+    const ParseNode *right = node->children_[1];
+    if (OB_NOT_NULL(left) && OB_NOT_NULL(left->str_value_) && left->str_len_ > 0 && OB_NOT_NULL(right)) {
+      ObString key(left->str_len_, left->str_value_);
+      if (0 == key.case_compare("max_retries")) {
+        if (T_INT == right->type_) {
+          ai_col.max_retries_ = static_cast<int32_t>(right->value_);
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "invalid max_retries value", K(ret), K(right->type_));
+        }
+      } else if (0 == key.case_compare("sync_mode")) {
+        if (T_VARCHAR == right->type_) {
+          if (OB_FAIL(ob_write_string(*allocator_,
+                ObString(right->str_len_, right->str_value_), ai_col.sync_mode_))) {
+            SQL_RESV_LOG(WARN, "failed to copy sync_mode", K(ret));
+          }
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "invalid sync_mode value", K(ret), K(right->type_));
+        }
+      } else if (0 == key.case_compare("strict_read")) {
+        if (T_INT == right->type_) {
+          ai_col.strict_read_ = (right->value_ != 0);
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "invalid strict_read value", K(ret), K(right->type_));
+        }
+      } else {
+        SQL_RESV_LOG(WARN, "unknown ai column option, ignore", K(key));
+      }
+    } else if (OB_FAIL(resolve_ai_column_options(left, ai_col))) {
+      SQL_RESV_LOG(WARN, "failed to resolve left ai column option", K(ret));
+    } else if (OB_FAIL(resolve_ai_column_options(right, ai_col))) {
+      SQL_RESV_LOG(WARN, "failed to resolve right ai column option", K(ret));
+    }
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "unexpected ai column options node", K(ret), K(node->type_));
+  }
+  return ret;
+}
+
 int ObCreateTableResolver::resolve_ai_column_definition(
     const ParseNode *attr_node, const ObColumnSchemaV2 &column, ObTableSchema &table_schema)
 {
@@ -2386,6 +2436,9 @@ int ObCreateTableResolver::resolve_ai_column_definition(
     ai_col.max_retries_ = 2;
     ai_col.strict_read_ = false;
     ai_col.sync_mode_ = ObString::make_string("async");
+    if (OB_FAIL(resolve_ai_column_options(attr_node->children_[1], ai_col))) {
+      SQL_RESV_LOG(WARN, "failed to resolve ai column options", K(ret));
+    }
 
     // 三个隐藏列直接 add_column，id 用 gen_column_id 保证不冲突
     ObColumnSchemaV2 hidden_col;
@@ -2425,7 +2478,8 @@ int ObCreateTableResolver::resolve_ai_column_definition(
         ObString expr_str = ObString::make_string("AI_COLUMN_EXPR");
         if (column.is_json()) {
           char buf[1024];
-          snprintf(buf, sizeof(buf), "Return exactly one valid JSON value");
+          snprintf(buf, sizeof(buf), "%.*s Return exactly one valid JSON value",
+                   expr_str.length(), expr_str.ptr());
           if (OB_FAIL(ob_write_string(*allocator_, ObString(strlen(buf), buf), expr_str))) {
           }
         }

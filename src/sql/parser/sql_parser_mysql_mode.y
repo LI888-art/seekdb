@@ -6193,13 +6193,13 @@ opt_ai_column_options:
 ai_column_options:
 NAME_OB COMP_EQ expr_const
 {
-  (void)($1);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 1, $3);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
 }
 | ai_column_options ',' NAME_OB COMP_EQ expr_const
 {
-  (void)($3);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $5);
+  ParseNode *kv_node = NULL;
+  malloc_non_terminal_node(kv_node, result->malloc_pool_, T_LINK_NODE, 2, $3, $5);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, kv_node);
 }
 ;
 
