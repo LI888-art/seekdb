@@ -1772,6 +1772,7 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
                                              const bool is_create_table_as,
                                              const bool allow_has_default)
 {
+
   int ret = OB_SUCCESS;
   bool is_modify_column = stmt::T_ALTER_TABLE == stmt_->get_stmt_type()
                   && OB_DDL_MODIFY_COLUMN == (static_cast<AlterColumnSchema &>(column)).alter_type_;
@@ -2064,6 +2065,11 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
                                                    bool &is_modify_column_visibility,
                                                    const bool allow_has_default)
 {
+
+  if (OB_NOT_NULL(attrs_node) && T_AI_COLUMN_DEFINITION == attrs_node->type_) {
+    return OB_SUCCESS;
+  }
+
   int ret = OB_SUCCESS;
   ObObjParam default_value;
   default_value.set_null();
@@ -2082,6 +2088,10 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       ret = OB_INVALID_ARGUMENT;
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < attrs_node->num_child_; ++i) {
+      if (OB_NOT_NULL(attrs_node->children_[i]) && T_AI_COLUMN_DEFINITION == attrs_node->children_[i]->type_) {
+        continue;
+      }
+
       ParseNode *attr_node = attrs_node->children_[i];
       switch (attr_node->type_) {
       case T_CONSTR_NOT_NULL: {

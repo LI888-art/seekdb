@@ -1735,6 +1735,10 @@ BEGIN(in_c_comment);
   }
 }
 
+[Aa][Ii][ \t\n]+[Cc][Oo][Ll][Uu][Mm][Nn]/[^A-Za-z0-9_] {
+  return AI_COLUMN;
+}
+
 {identifier} {
   const NonReservedKeyword *word = NULL;
   if (IS_FAST_PARAMETERIZE) {
