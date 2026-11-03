@@ -2475,6 +2475,22 @@ int ObCreateTableResolver::resolve_ai_column_definition(
       if (OB_FAIL(ob_write_string(*allocator_, column.get_column_name_str(), ai_col.column_name_))) {
       } else if (OB_FAIL(ob_write_string(*allocator_, ObString::make_string("mock"), ai_col.ai_model_name_))) {
       } else {
+        // override with AST-extracted model name from AI_COMPLETE('model', ...) / AI_EMBED('model', ...)
+        if (OB_NOT_NULL(attr_node->children_[0])) {
+          const ParseNode *func_node = attr_node->children_[0];
+          if (T_FUN_SYS == func_node->type_ && func_node->num_child_ >= 2
+              && OB_NOT_NULL(func_node->children_[1])
+              && func_node->children_[1]->num_child_ >= 1) {
+            const ParseNode *model_node = func_node->children_[1]->children_[0];
+            if (OB_NOT_NULL(model_node) && OB_NOT_NULL(model_node->str_value_)
+                && model_node->str_len_ > 0) {
+              ObString model_name(model_node->str_len_, model_node->str_value_);
+              if (OB_FAIL(ob_write_string(*allocator_, model_name, ai_col.ai_model_name_))) {
+                SQL_RESV_LOG(WARN, "failed to copy ai_model_name", K(ret));
+              }
+            }
+          }
+        }
         ObString expr_str = ObString::make_string("AI_COLUMN_EXPR");
         if (column.is_json()) {
           char buf[1024];
