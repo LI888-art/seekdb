@@ -672,6 +672,8 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     }
 
     int64_t resolved_cols_count = resolved_cols.count();
+    common::ObSEArray<const ParseNode *, 8> pending_ai_nodes;
+    common::ObSEArray<int64_t, 8> pending_ai_ele_pos;
     // Second pass traversal, use resolved_cols to parse out all column schema and save to table_schema
     // And parse index etc
     for (int32_t i = 0, ele_pos = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
@@ -847,8 +849,11 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
                 };
                 collect_ai(attrs_node);
                 for (auto *n : ai_nodes) {
-                  if (OB_FAIL(resolve_ai_column_definition(n, column, table_schema))) {
-                    SQL_RESV_LOG(WARN, "failed to resolve AI COLUMN", K(ret));
+                  if (OB_FAIL(pending_ai_nodes.push_back(n))) {
+                    SQL_RESV_LOG(WARN, "failed to push pending ai node", K(ret));
+                    break;
+                  } else if (OB_FAIL(pending_ai_ele_pos.push_back(ele_pos - 1))) {
+                    SQL_RESV_LOG(WARN, "failed to push pending ai pos", K(ret));
                     break;
                   }
                 }
@@ -903,6 +908,20 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         // won't be here
         ret = OB_ERR_UNEXPECTED;
         SQL_RESV_LOG(WARN, "unexpected branch", K(ret));
+      }
+    }
+
+    // process deferred AI columns after all physical columns are added
+    for (int64_t i = 0; OB_SUCC(ret) && i < pending_ai_nodes.count(); ++i) {
+      int64_t pos = pending_ai_ele_pos.at(i);
+      if (OB_UNLIKELY(pos < 0 || pos >= resolved_cols.count())) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "invalid pending ai pos", K(ret), K(pos));
+      } else {
+        ObColumnSchemaV2 &ai_column = resolved_cols.at(pos);
+        if (OB_FAIL(resolve_ai_column_definition(pending_ai_nodes.at(i), ai_column, table_schema))) {
+          SQL_RESV_LOG(WARN, "failed to resolve deferred AI COLUMN", K(ret));
+        }
       }
     }
 
@@ -2496,6 +2515,7 @@ int ObCreateTableResolver::resolve_ai_column_definition(
     }
 
     if (OB_SUCC(ret)) {
+      table_schema.set_max_used_column_id(ai_col.result_spec_column_id_);
       if (OB_FAIL(ob_write_string(*allocator_, column.get_column_name_str(), ai_col.column_name_))) {
       } else if (OB_FAIL(ob_write_string(*allocator_, ObString::make_string("mock"), ai_col.ai_model_name_))) {
       } else {
