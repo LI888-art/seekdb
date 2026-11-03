@@ -2420,6 +2420,30 @@ int ObCreateTableResolver::resolve_ai_column_definition(
     const ParseNode *attr_node, const ObColumnSchemaV2 &column, ObTableSchema &table_schema)
 {
   int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(attr_node) && attr_node->num_child_ == 2
+      && OB_NOT_NULL(attr_node->children_[0])) {
+    const ParseNode *func_node = attr_node->children_[0];
+    if (T_FUN_SYS == func_node->type_ && func_node->num_child_ >= 2
+        && OB_NOT_NULL(func_node->children_[1])
+        && func_node->children_[1]->num_child_ >= 3) {
+      const ParseNode *dim_node = func_node->children_[1]->children_[2];
+      if (OB_NOT_NULL(dim_node) && T_INT == dim_node->type_) {
+        int64_t expected_dim = 0;
+        int dim_ret = ObVectorIndexUtil::get_vector_dim_from_extend_type_info(
+            column.get_extended_type_info(), expected_dim);
+        if (OB_SUCCESS == dim_ret && expected_dim != dim_node->value_) {
+          ret = OB_ERR_INVALID_VECTOR_DIM;
+          LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM,
+                         static_cast<uint32_t>(expected_dim),
+                         static_cast<uint32_t>(dim_node->value_));
+          SQL_RESV_LOG(WARN, "ai embed dim mismatch", K(ret), K(expected_dim), K(dim_node->value_));
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
   if (OB_ISNULL(attr_node) || attr_node->num_child_ != 2) {
     ret = OB_ERR_UNEXPECTED;
   } else {
