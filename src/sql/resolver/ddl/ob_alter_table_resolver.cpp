@@ -3496,6 +3496,94 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
           }
         }
+        // AI COLUMN: minimal — only store ai metadata, no id, no hidden cols
+        if (OB_SUCC(ret) && node.children_[i]->num_child_ > 2
+            && OB_NOT_NULL(node.children_[i]->children_[2])) {
+          const ParseNode *attrs_node = node.children_[i]->children_[2];
+          const ParseNode *ai_node = NULL;
+          if (T_AI_COLUMN_DEFINITION == attrs_node->type_) {
+            ai_node = attrs_node;
+          } else {
+            for (int64_t k = 0; NULL == ai_node && k < attrs_node->num_child_; ++k) {
+              if (OB_NOT_NULL(attrs_node->children_[k])
+                  && T_AI_COLUMN_DEFINITION == attrs_node->children_[k]->type_) {
+                ai_node = attrs_node->children_[k];
+              }
+            }
+          }
+          if (OB_NOT_NULL(ai_node)) {
+            ObTableSchema &alter_schema = get_alter_table_stmt()->get_alter_table_schema();
+            ObAIColumnSchema ai_col;
+            ai_col.column_id_ = OB_INVALID_ID;
+            ai_col.max_retries_ = 2;
+            ai_col.strict_read_ = false;
+            ai_col.sync_mode_ = ObString::make_string("async");
+            // model name
+            if (OB_NOT_NULL(ai_node->children_[0])) {
+              const ParseNode *fn = ai_node->children_[0];
+              if (T_FUN_SYS == fn->type_ && fn->num_child_ >= 2
+                  && OB_NOT_NULL(fn->children_[1]) && fn->children_[1]->num_child_ >= 1) {
+                const ParseNode *mn = fn->children_[1]->children_[0];
+                if (OB_NOT_NULL(mn) && OB_NOT_NULL(mn->str_value_) && mn->str_len_ > 0) {
+                  if (OB_FAIL(ob_write_string(*allocator_,
+                      ObString(mn->str_len_, mn->str_value_), ai_col.ai_model_name_))) {
+                  }
+                }
+              }
+            }
+            // WITH options
+            if (OB_SUCC(ret) && OB_NOT_NULL(ai_node->children_[1])) {
+              ObSEArray<const ParseNode *, 8> opt_stack;
+              if (OB_FAIL(opt_stack.push_back(ai_node->children_[1]))) {
+              }
+              while (OB_SUCC(ret) && !opt_stack.empty()) {
+                const ParseNode *n = opt_stack.at(opt_stack.count() - 1);
+                opt_stack.pop_back();
+                if (OB_ISNULL(n)) { continue; }
+                if (T_LINK_NODE == n->type_ && 2 == n->num_child_) {
+                  const ParseNode *left = n->children_[0];
+                  const ParseNode *right = n->children_[1];
+                  if (OB_NOT_NULL(left) && OB_NOT_NULL(left->str_value_) && left->str_len_ > 0
+                      && OB_NOT_NULL(right)) {
+                    ObString key(left->str_len_, left->str_value_);
+                    if (0 == key.case_compare("max_retries") && T_INT == right->type_) {
+                      ai_col.max_retries_ = static_cast<int32_t>(right->value_);
+                    } else if (0 == key.case_compare("sync_mode") && T_VARCHAR == right->type_) {
+                      if (OB_FAIL(ob_write_string(*allocator_,
+                          ObString(right->str_len_, right->str_value_), ai_col.sync_mode_))) {
+                      }
+                    }
+                  } else {
+                    if (OB_NOT_NULL(left) && OB_FAIL(opt_stack.push_back(left))) {
+                    } else if (OB_NOT_NULL(right) && OB_FAIL(opt_stack.push_back(right))) {
+                    }
+                  }
+                }
+              }
+            }
+            // column name
+            if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator_,
+                alter_column_schema.get_column_name_str(), ai_col.column_name_))) {
+            }
+            // normalized_expr
+            if (OB_SUCC(ret)) {
+              ObString expr_str = ObString::make_string("AI_COLUMN_EXPR");
+              if (alter_column_schema.is_json()) {
+                char buf[1024];
+                snprintf(buf, sizeof(buf), "%.*s Return exactly one valid JSON value",
+                         expr_str.length(), expr_str.ptr());
+                if (OB_FAIL(ob_write_string(*allocator_, ObString(strlen(buf), buf), expr_str))) {
+                }
+              }
+              if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator_, expr_str, ai_col.normalized_expr_))) {
+              }
+            }
+            // add_ai_column (no hidden cols here)
+            if (OB_SUCC(ret) && OB_FAIL(alter_schema.add_ai_column(ai_col))) {
+              SQL_RESV_LOG(WARN, "failed to add ai col to alter schema", K(ret));
+            }
+          }
+        }
       }
     }
     add_column_cnt_++;

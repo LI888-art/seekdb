@@ -8605,36 +8605,68 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
     }
 
     // AI COLUMN: move new AI columns to new_table_schema and persist to __all_ai_column
+    {
+      FILE *tf = fopen("/tmp/hidden_dbg.log", "a");
+      if (tf) { fprintf(tf, "[HIDDEN] ai_cnt=%ld\n", alter_table_schema.get_ai_column_count()); fclose(tf); }
+    }
     if (OB_SUCC(ret) && alter_table_schema.get_ai_column_count() > 0) {
       for (int64_t ai_i = 0; OB_SUCC(ret) && ai_i < alter_table_schema.get_ai_column_count(); ++ai_i) {
-        const ObAIColumnSchema &ai_col = alter_table_schema.get_ai_columns().at(ai_i);
-        if (OB_FAIL(new_table_schema.add_ai_column_copy(ai_col))) {
-          LOG_WARN("failed to add ai column to new_table_schema", K(ret));
+        ObAIColumnSchema ai_col = alter_table_schema.get_ai_columns().at(ai_i);
+        // find tags column in new_table_schema by name
+        const ObColumnSchemaV2 *tags_col = new_table_schema.get_column_schema(ai_col.column_name_);
+        if (OB_ISNULL(tags_col)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("ai column not found in new_table_schema", K(ret), K(ai_col.column_name_));
         } else {
-          ObColumnSchemaV2 physical_col;
+          uint64_t tags_id = tags_col->get_column_id();
+          ai_col.column_id_ = tags_id;
+          // allocate hidden col ids
+          uint64_t max_id = new_table_schema.get_max_used_column_id();
+          if (max_id < tags_id) {
+            max_id = tags_id;
+          }
+          ai_col.state_column_id_ = max_id + 1;
+          ai_col.request_column_id_ = max_id + 2;
+          ai_col.result_spec_column_id_ = max_id + 3;
+          new_table_schema.set_max_used_column_id(ai_col.result_spec_column_id_);
+          // create 3 hidden cols
           ObCharsetType charset = new_table_schema.get_charset_type();
           ObCollationType collation = CS_TYPE_UTF8MB4_GENERAL_CI;
           if (CHARSET_INVALID == charset || CHARSET_BINARY == charset) {
             charset = CHARSET_UTF8MB4;
           }
-          physical_col.set_column_id(ai_col.column_id_);
-          physical_col.set_data_type(ObLongTextType);
-          physical_col.set_nullable(true);
-          physical_col.set_charset_type(charset);
-          physical_col.set_collation_type(collation);
-          physical_col.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObLongTextType]);
-          if (OB_FAIL(physical_col.set_column_name(ai_col.column_name_))) {
-            LOG_WARN("failed to set ai physical column name in alter", K(ret));
-          } else if (OB_FAIL(new_table_schema.add_column(physical_col))) {
-            LOG_WARN("failed to add ai physical column in alter", K(ret));
-          } else {
-            ObColumnSchemaV2 *added_col = new_table_schema.get_column_schema(ai_col.column_id_);
-            if (OB_ISNULL(added_col)) {
-              ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("failed to get added ai physical column", K(ret), K(ai_col.column_id_));
-            } else if (OB_FAIL(ddl_operator.insert_single_column(trans, new_table_schema, *added_col))) {
-              LOG_WARN("failed to persist ai physical column in alter", K(ret));
+          char name_buf[128];
+          uint64_t ids[3] = {static_cast<uint64_t>(ai_col.state_column_id_), static_cast<uint64_t>(ai_col.request_column_id_), static_cast<uint64_t>(ai_col.result_spec_column_id_)};
+          const char *prefix[3] = {"__state_", "__request_", "__result_"};
+          for (int k = 0; OB_SUCC(ret) && k < 3; ++k) {
+            ObColumnSchemaV2 hidden_col;
+            hidden_col.set_table_id(new_table_schema.get_table_id());
+            hidden_col.set_column_id(ids[k]);
+            hidden_col.set_data_type(ObIntType);
+            hidden_col.set_nullable(true);
+            hidden_col.set_is_hidden(true);
+            hidden_col.set_charset_type(CHARSET_BINARY);
+            hidden_col.set_collation_type(CS_TYPE_BINARY);
+            hidden_col.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObIntType]);
+            snprintf(name_buf, sizeof(name_buf), "%s%.*s", prefix[k],
+                     ai_col.column_name_.length(), ai_col.column_name_.ptr());
+            if (OB_FAIL(hidden_col.set_column_name(name_buf))) {
+              LOG_WARN("failed to set hidden col name", K(ret));
+            } else if (OB_FAIL(new_table_schema.add_column(hidden_col))) {
+              LOG_WARN("failed to add hidden col to new_table_schema", K(ret), K(name_buf));
+              FILE *tf = fopen("/tmp/hidden_dbg.log", "a");
+              if (tf) { fprintf(tf, "[HIDDEN] add_column FAIL name=%s ret=%d\n", name_buf, ret); fclose(tf); }
+            } else if (OB_FAIL(ddl_operator.insert_single_column(trans, new_table_schema, hidden_col))) {
+              LOG_WARN("failed to persist hidden col", K(ret));
+              FILE *tf = fopen("/tmp/hidden_dbg.log", "a");
+              if (tf) { fprintf(tf, "[HIDDEN] insert_single_column FAIL name=%s ret=%d\n", name_buf, ret); fclose(tf); }
+            } else {
+              FILE *tf = fopen("/tmp/hidden_dbg.log", "a");
+              if (tf) { fprintf(tf, "[HIDDEN] OK name=%s id=%lu\n", name_buf, hidden_col.get_column_id()); fclose(tf); }
             }
+          }
+          if (OB_SUCC(ret) && OB_FAIL(new_table_schema.add_ai_column_copy(ai_col))) {
+            LOG_WARN("failed to add ai column to new_table_schema", K(ret));
           }
         }
       }
@@ -8648,7 +8680,7 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
         } else {
           ObTableSqlService &sql_service = schema_service->get_table_sql_service();
           if (OB_FAIL(sql_service.add_ai_columns(trans, new_table_schema))) {
-            LOG_WARN("failed to add ai columns in alter_table_column", K(ret));
+            LOG_WARN("failed to add ai columns in alter", K(ret));
           }
         }
       }
