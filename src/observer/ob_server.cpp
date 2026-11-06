@@ -2199,6 +2199,18 @@ int ObServer::init_server_runtime()
     if (OB_FAIL(ai_column_task_worker_.init(&sql_proxy_))) {
     } else if (OB_FAIL(server_gtimer_.schedule(ai_column_task_worker_, 2000000, true))) {
     }
+    // 中断恢复: 把上次崩溃遗留的 PROCESSING(state=2) 任务重置为 PENDING(state=1)
+    if (OB_SUCC(ret)) {
+      int64_t reset_rows = 0;
+      const char *reset_sql =
+        "UPDATE ai_column_p0_t1.task_shadow SET state=1 WHERE state=2";
+      int tmp_ret = sql_proxy_.write(reset_sql, reset_rows);
+      if (OB_SUCCESS != tmp_ret) {
+        LOG_WARN("reset orphan ai tasks failed", K(tmp_ret));
+      } else {
+        LOG_INFO("reset orphan ai tasks", K(reset_rows));
+      }
+    }
   }
 
   return ret;
