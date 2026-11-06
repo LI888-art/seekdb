@@ -1,5 +1,7 @@
 #define USING_LOG_PREFIX SERVER
 #include "ob_ai_column_task_worker.h"
+#include "lib/allocator/page_arena.h"
+#include "lib/allocator/ob_allocator.h"
 #include "common/mysqlclient/ob_mysql_proxy.h"
 #include "common/mysqlclient/ob_mysql_result.h"
 #include "lib/oblog/ob_log_module.h"
@@ -60,32 +62,146 @@ int ObAIColumnTaskWorker::process_tasks()
             || OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(5), retry_count))) {
           OB_LOG(WARN, "read task cols failed", K(ret));
         } else {
-          // 第一阶段：模拟模型返回，写 tags 可见列
-          // __state_tags 隐藏列暂不写，用 task_shadow 存在性表示 PENDING
-          char upd_sql[1024];
-          snprintf(upd_sql, sizeof(upd_sql),
-                   "UPDATE ai_column_p0_t1.docs SET tags='{}' WHERE %.*s",
-                   rowkey_predicate.length(), rowkey_predicate.ptr());
-          int64_t dummy = 0;
-          int tmp_ret = sql_proxy_->write(upd_sql, dummy);
+          int tmp_ret = process_one_task(tenant_id, table_id, column_id,
+                                         rowkey_predicate, request_id, retry_count);
           if (OB_SUCCESS != tmp_ret) {
-            OB_LOG(WARN, "update docs state failed", K(tmp_ret), K(upd_sql));
-          }
-          char del_sql[1024];
-          snprintf(del_sql, sizeof(del_sql),
-                   "DELETE FROM ai_column_p0_t1.task_shadow "
-                   "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
-                   "AND rowkey_predicate='%.*s'",
-                   tenant_id, table_id, column_id,
-                   rowkey_predicate.length(), rowkey_predicate.ptr());
-          tmp_ret = sql_proxy_->write(del_sql, dummy);
-          if (OB_SUCCESS != tmp_ret) {
-            OB_LOG(WARN, "delete ai task failed", K(tmp_ret), K(del_sql));
+            OB_LOG(WARN, "process one task failed", K(tmp_ret),
+                   K(tenant_id), K(table_id), K(column_id));
           }
         }
       }
     }
   }
+  return ret;
+}
+
+int ObAIColumnTaskWorker::process_one_task(
+    int64_t tenant_id, int64_t table_id, int64_t column_id,
+    const ObString &rowkey_predicate, int64_t request_id, int64_t retry_count)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator alloc("ai_worker");
+  char sql_buf[2048];
+
+  // 1. 查 __all_ai_column 拿 model_name + normalized_expr + max_retries
+  ObString model_name, normalized_expr;
+  int64_t max_retries = 2;
+  {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "SELECT ai_model_name, normalized_expr, max_retries "
+               "FROM oceanbase.__all_ai_column WHERE table_id=%ld AND column_id=%ld",
+               table_id, column_id);
+      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+        OB_LOG(WARN, "query ai_column meta failed", K(ret), K(sql_buf));
+      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+        ret = OB_ENTRY_NOT_EXIST;
+      } else {
+        ObString tmp_model, tmp_expr;
+        if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_model))
+            || OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(1), tmp_expr))
+            || OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(2), max_retries))) {
+          OB_LOG(WARN, "read ai_column meta cols failed", K(ret));
+        } else {
+          ob_write_string(alloc, tmp_model, model_name);
+          ob_write_string(alloc, tmp_expr, normalized_expr);
+        }
+      }
+    }
+  }
+
+  // 2. 查 docs 拿依赖列 content
+  ObString content;
+  if (OB_SUCC(ret)) {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "SELECT content FROM ai_column_p0_t1.docs WHERE %.*s",
+               rowkey_predicate.length(), rowkey_predicate.ptr());
+      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+        OB_LOG(WARN, "query docs content failed", K(ret), K(sql_buf));
+      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+        ret = OB_ENTRY_NOT_EXIST;
+      } else {
+        ObString tmp_content;
+        res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_content);
+        ob_write_string(alloc, tmp_content, content);
+      }
+    }
+  }
+
+  // 3. 拼 prompt
+  if (OB_SUCC(ret)) {
+    int64_t prompt_len = snprintf(sql_buf, sizeof(sql_buf), "%.*s\n%.*s",
+                                  normalized_expr.length(), normalized_expr.ptr(),
+                                  content.length(), content.ptr());
+    if (prompt_len <= 0 || prompt_len >= (int64_t)sizeof(sql_buf)) {
+      ret = OB_SIZE_OVERFLOW;
+      OB_LOG(WARN, "prompt too long", K(ret), K(prompt_len));
+    }
+  }
+
+  // 4. 迟到保护：写回前再查 request_id
+  if (OB_SUCC(ret)) {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "SELECT request_id FROM ai_column_p0_t1.task_shadow "
+               "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+               "AND rowkey_predicate='%.*s'",
+               tenant_id, table_id, column_id,
+               rowkey_predicate.length(), rowkey_predicate.ptr());
+      int64_t cur_req = -1;
+      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+        OB_LOG(WARN, "query cur request_id failed", K(ret));
+      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+        ret = OB_ENTRY_NOT_EXIST;
+        OB_LOG(INFO, "task gone, skip", K(ret));
+      } else {
+        res.get_result()->get_int(static_cast<int64_t>(0), cur_req);
+        if (cur_req != request_id) {
+          OB_LOG(INFO, "late result discarded", K(cur_req), K(request_id));
+          ret = OB_ENTRY_NOT_EXIST;
+        }
+      }
+    }
+  }
+
+  // 5. 写回（占位：tags='{}'）
+  if (OB_SUCC(ret)) {
+    snprintf(sql_buf, sizeof(sql_buf),
+             "UPDATE ai_column_p0_t1.docs SET tags='{}' WHERE %.*s",
+             rowkey_predicate.length(), rowkey_predicate.ptr());
+    int64_t affected = 0;
+    if (OB_FAIL(sql_proxy_->write(sql_buf, affected))) {
+      OB_LOG(WARN, "writeback failed", K(ret), K(sql_buf));
+    }
+  }
+
+  // 6. 成功删任务 / 失败重试
+  if (OB_SUCC(ret)) {
+    snprintf(sql_buf, sizeof(sql_buf),
+             "DELETE FROM ai_column_p0_t1.task_shadow "
+             "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+             "AND rowkey_predicate='%.*s' AND request_id=%ld",
+             tenant_id, table_id, column_id,
+             rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
+    int64_t affected = 0;
+    sql_proxy_->write(sql_buf, affected);
+  } else if (OB_ENTRY_NOT_EXIST == ret) {
+    ret = OB_SUCCESS;
+  } else {
+    int64_t new_retry = retry_count + 1;
+    int64_t new_state = (new_retry > max_retries) ? 3 : 1;
+    snprintf(sql_buf, sizeof(sql_buf),
+             "UPDATE ai_column_p0_t1.task_shadow SET retry_count=%ld, state=%ld "
+             "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+             "AND rowkey_predicate='%.*s'",
+             new_retry, new_state, tenant_id, table_id, column_id,
+             rowkey_predicate.length(), rowkey_predicate.ptr());
+    int64_t affected = 0;
+    sql_proxy_->write(sql_buf, affected);
+    OB_LOG(WARN, "task retry scheduled", K(ret), K(new_retry), K(new_state));
+  }
+
   return ret;
 }
 

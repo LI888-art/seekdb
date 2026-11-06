@@ -21,6 +21,9 @@ public:
 private:
   int claim_tasks(int64_t &affected);
   int process_tasks();
+  int process_one_task(int64_t tenant_id, int64_t table_id, int64_t column_id,
+                       const common::ObString &rowkey_predicate,
+                       int64_t request_id, int64_t retry_count);
   bool inited_;
   common::ObMySQLProxy *sql_proxy_;
 };
