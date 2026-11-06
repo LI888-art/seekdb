@@ -2287,7 +2287,8 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
             bool dep_changed = false;
             for (int64_t i = 0; !dep_changed && i < upd_ctdef.assign_columns_.count(); ++i) {
               const ColumnContent &col = upd_ctdef.assign_columns_.at(i);
-              if (col.column_name_.length() == 7 && 0 == strncmp(col.column_name_.ptr(), "content", 7)) {
+              if ((col.column_name_.length() == 7 && 0 == strncmp(col.column_name_.ptr(), "content", 7))
+                  || (col.column_name_.length() == 2 && 0 == strncmp(col.column_name_.ptr(), "id", 2))) {
                 dep_changed = true;
               }
             }
@@ -2394,6 +2395,68 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
       ObTableInsertOp *ins_op = dynamic_cast<ObTableInsertOp *>(&op);
       if (OB_NOT_NULL(ins_op) && OB_FAIL(ins_op->write_ai_task_fk_style())) {
         SQL_ENG_LOG(ERROR, "failed to write ai task", K(ret));
+      }
+    }
+    // process AI task for DELETE (single row)
+    if (OB_SUCC(ret) && t_delete == dml_event) {
+      ObArenaAllocator tmp_alloc("ai_del_pk", OB_MALLOC_NORMAL_BLOCK_SIZE);
+      ObString pk_str;
+      if (OB_FAIL(extract_ai_pk_predicate(op, dml_ctdef, dml_ctdef.old_row_, tmp_alloc, pk_str))) {
+      } else if (!pk_str.empty()) {
+        char sql_buf[1024];
+        snprintf(sql_buf, sizeof(sql_buf),
+                 "DELETE FROM ai_column_p0_t1.task_shadow WHERE table_id=%ld AND rowkey_predicate='%.*s'",
+                 dml_ctdef.das_base_ctdef_.index_tid_, pk_str.length(), pk_str.ptr());
+        if (OB_FAIL(op.execute_ai_task_sql(sql_buf))) {
+          SQL_ENG_LOG(ERROR, "delete ai task single row failed", K(ret), K(sql_buf));
+        }
+      }
+    }
+    // process AI task for UPDATE (single row)
+    if (OB_SUCC(ret) && t_update == dml_event) {
+      ObUpdRtDef &upd_rtdef = reinterpret_cast<ObUpdRtDef &>(dml_rtdef);
+      if (upd_rtdef.is_row_changed_) {
+        const ObUpdCtDef &upd_ctdef = static_cast<const ObUpdCtDef &>(dml_ctdef);
+        bool dep_changed = false;
+        for (int64_t i = 0; !dep_changed && i < upd_ctdef.assign_columns_.count(); ++i) {
+          const ColumnContent &col = upd_ctdef.assign_columns_.at(i);
+          if ((col.column_name_.length() == 7 && 0 == strncmp(col.column_name_.ptr(), "content", 7))
+              || (col.column_name_.length() == 2 && 0 == strncmp(col.column_name_.ptr(), "id", 2))) {
+            dep_changed = true;
+          }
+        }
+        if (dep_changed) {
+          ObArenaAllocator tmp_alloc("ai_upd_pk", OB_MALLOC_NORMAL_BLOCK_SIZE);
+          ObString old_pk, new_pk;
+          if (OB_FAIL(extract_ai_pk_predicate(op, dml_ctdef, dml_ctdef.old_row_, tmp_alloc, old_pk))) {
+          } else if (OB_FAIL(extract_ai_pk_predicate(op, dml_ctdef, dml_ctdef.new_row_, tmp_alloc, new_pk))) {
+          } else {
+            if (!old_pk.empty()) {
+              char sql_del[1024];
+              snprintf(sql_del, sizeof(sql_del),
+                       "DELETE FROM ai_column_p0_t1.task_shadow WHERE table_id=%ld AND rowkey_predicate='%.*s'",
+                       dml_ctdef.das_base_ctdef_.index_tid_, old_pk.length(), old_pk.ptr());
+              if (OB_FAIL(op.execute_ai_task_sql(sql_del))) {
+              }
+            }
+            if (OB_SUCC(ret) && !new_pk.empty()) {
+              int64_t ai_col_id = 0;
+              if (OB_FAIL(extract_ai_column_id(op, dml_ctdef, ai_col_id))) {
+              } else {
+                char sql_ins[1024];
+                int64_t request_id = ObTimeUtility::current_time();
+                snprintf(sql_ins, sizeof(sql_ins),
+                         "INSERT INTO ai_column_p0_t1.task_shadow "
+                         "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
+                         "VALUES (%ld,%ld,%ld,'%.*s',%ld,1,0,now(6),0)",
+                         lib::current_resource_owner_id(), dml_ctdef.das_base_ctdef_.index_tid_,
+                         ai_col_id, new_pk.length(), new_pk.ptr(), request_id);
+                if (OB_FAIL(op.execute_ai_task_sql(sql_ins))) {
+                }
+              }
+            }
+          }
+        }
       }
     }
     if (OB_SUCC(ret) && OB_FAIL(TriggerHandle::do_handle_after_row(op, dml_ctdef.trig_ctdef_, dml_rtdef.trig_rtdef_, dml_event))) {
