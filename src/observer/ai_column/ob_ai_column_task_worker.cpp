@@ -14,6 +14,26 @@ using namespace oceanbase::common;
 namespace oceanbase {
 namespace observer {
 
+static const char *safe_memmem(const char *haystack, int64_t haystack_len,
+                               const char *needle, int64_t needle_len)
+{
+  if (haystack_len < needle_len || needle_len <= 0) return nullptr;
+  for (int64_t i = 0; i <= haystack_len - needle_len; ++i) {
+    if (0 == memcmp(haystack + i, needle, needle_len)) {
+      return haystack + i;
+    }
+  }
+  return nullptr;
+}
+
+static const char *safe_strchr(const char *haystack, int64_t haystack_len, char c)
+{
+  for (int64_t i = 0; i < haystack_len; ++i) {
+    if (haystack[i] == c) return haystack + i;
+  }
+  return nullptr;
+}
+
 static int64_t json_escape_for_http(const char *src, int64_t src_len,
                                     char *dst, int64_t dst_size)
 {
@@ -57,7 +77,7 @@ int ObAIColumnTaskWorker::claim_tasks(int64_t &affected)
   int ret = OB_SUCCESS;
   affected = 0;
   const char *claim_sql =
-    "UPDATE ai_column_p0_t1.task_shadow SET state=2 "
+    "UPDATE oceanbase.__all_ai_column_task SET state=2 "
     "WHERE state=1 AND eligible_ts <= now(6) LIMIT 10";
   if (OB_FAIL(sql_proxy_->write(claim_sql, affected))) {
     OB_LOG(WARN, "claim ai tasks failed", K(ret));
@@ -71,7 +91,7 @@ int ObAIColumnTaskWorker::process_tasks()
   SMART_VAR(ObMySQLProxy::MySQLResult, res) {
     const char *select_sql =
       "SELECT tenant_id, table_id, column_id, rowkey_predicate, request_id, retry_count "
-      "FROM ai_column_p0_t1.task_shadow WHERE state=2";
+      "FROM oceanbase.__all_ai_column_task WHERE state=2";
     if (OB_FAIL(sql_proxy_->read(res, select_sql))) {
       OB_LOG(WARN, "select ai tasks failed", K(ret));
     } else if (OB_ISNULL(res.get_result())) {
@@ -107,24 +127,31 @@ int ObAIColumnTaskWorker::process_one_task(
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator alloc("ai_worker");
-  char sql_buf[2048];
+  char sql_buf[16384];
   char prompt_buf[4096];
   int64_t prompt_len = 0;
 
-  // 0. 查表名（动态）
-  ObString table_name;
+  // 0. 查表名 + 库名（动态）
+  ObString table_name, database_name;
   {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       snprintf(sql_buf, sizeof(sql_buf),
-               "SELECT table_name FROM oceanbase.__all_table WHERE table_id=%ld", table_id);
+               "SELECT t.table_name, d.database_name FROM oceanbase.__all_table t "
+               "JOIN oceanbase.__all_database d ON t.database_id = d.database_id "
+               "WHERE t.table_id=%ld", table_id);
       if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
         OB_LOG(WARN, "query table_name failed", K(ret), K(table_id));
       } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
         ret = OB_ENTRY_NOT_EXIST;
       } else {
-        ObString tmp_table;
+        ObString tmp_table, tmp_db;
         res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_table);
-        ob_write_string(alloc, tmp_table, table_name);
+        res.get_result()->get_varchar(static_cast<int64_t>(1), tmp_db);
+        if (OB_FAIL(ob_write_string(alloc, tmp_table, table_name))) {
+          OB_LOG(WARN, "copy table_name failed", K(ret));
+        } else if (OB_FAIL(ob_write_string(alloc, tmp_db, database_name))) {
+          OB_LOG(WARN, "copy database_name failed", K(ret));
+        }
       }
     }
   }
@@ -161,7 +188,8 @@ int ObAIColumnTaskWorker::process_one_task(
   if (OB_SUCC(ret)) {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       snprintf(sql_buf, sizeof(sql_buf),
-               "SELECT content FROM ai_column_p0_t1.%.*s WHERE %.*s",
+               "SELECT content FROM %.*s.%.*s WHERE %.*s",
+               database_name.length(), database_name.ptr(),
                table_name.length(), table_name.ptr(),
                rowkey_predicate.length(), rowkey_predicate.ptr());
       if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
@@ -191,7 +219,7 @@ int ObAIColumnTaskWorker::process_one_task(
   if (OB_SUCC(ret)) {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       snprintf(sql_buf, sizeof(sql_buf),
-               "SELECT request_id FROM ai_column_p0_t1.task_shadow "
+               "SELECT request_id FROM oceanbase.__all_ai_column_task "
                "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
                "AND rowkey_predicate='%.*s'",
                tenant_id, table_id, column_id,
@@ -248,7 +276,7 @@ int ObAIColumnTaskWorker::process_one_task(
         OB_LOG(WARN, "client init failed", K(ret));
       } else {
         // 判断端点类型：embeddings 还是 chat/completions
-        bool is_embedding_ep = (nullptr != strstr(ep_url.ptr(), "/embeddings"));
+        bool is_embedding_ep = (nullptr != safe_memmem(ep_url.ptr(), ep_url.length(), "/embeddings", 11));
         char model_esc[512];
         int64_t model_esc_len = json_escape_for_http(ep_req_model.ptr(), ep_req_model.length(),
                                                      model_esc, sizeof(model_esc));
@@ -292,9 +320,17 @@ int ObAIColumnTaskWorker::process_one_task(
           if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(alloc, resp_obj, resp_str))) {
           } else if (is_embedding_ep) {
             // 解析 data[0].embedding 数组 -> [v1,v2,v3,v4]
-            const char *emb_pos = strstr(resp_str.ptr(), "\"embedding\"");
-            const char *lb = (nullptr != emb_pos) ? strchr(emb_pos, '[') : nullptr;
-            const char *rb = (nullptr != lb) ? strchr(lb, ']') : nullptr;
+            const char *emb_pos = safe_memmem(resp_str.ptr(), resp_str.length(), "\"embedding\"", 11);
+            const char *lb = nullptr;
+            const char *rb = nullptr;
+            if (nullptr != emb_pos) {
+              int64_t off = emb_pos - resp_str.ptr();
+              lb = safe_strchr(resp_str.ptr() + off, resp_str.length() - off, '[');
+              if (nullptr != lb) {
+                int64_t lb_off = lb - resp_str.ptr();
+                rb = safe_strchr(resp_str.ptr() + lb_off, resp_str.length() - lb_off, ']');
+              }
+            }
             if (nullptr == lb || nullptr == rb) {
               ret = OB_ERR_UNEXPECTED;
               OB_LOG(WARN, "parse embedding array failed", K(ret), K(resp_str));
@@ -355,7 +391,8 @@ int ObAIColumnTaskWorker::process_one_task(
       OB_LOG(WARN, "column_name not found", K(ret), K(table_id), K(column_id));
     } else {
       snprintf(sql_buf, sizeof(sql_buf),
-               "UPDATE ai_column_p0_t1.%.*s SET %.*s='%s' WHERE %.*s",
+               "UPDATE %.*s.%.*s SET %.*s='%s' WHERE %.*s",
+               database_name.length(), database_name.ptr(),
                table_name.length(), table_name.ptr(),
                col_name.length(), col_name.ptr(),
                sql_escaped, rowkey_predicate.length(), rowkey_predicate.ptr());
@@ -370,7 +407,7 @@ int ObAIColumnTaskWorker::process_one_task(
   // 7. 成功删任务 / 失败重试
   if (OB_SUCC(ret)) {
     snprintf(sql_buf, sizeof(sql_buf),
-             "DELETE FROM ai_column_p0_t1.task_shadow "
+             "DELETE FROM oceanbase.__all_ai_column_task "
              "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
              "AND rowkey_predicate='%.*s' AND request_id=%ld",
              tenant_id, table_id, column_id,
@@ -383,7 +420,7 @@ int ObAIColumnTaskWorker::process_one_task(
     int64_t new_retry = retry_count + 1;
     int64_t new_state = (new_retry > max_retries) ? 3 : 1;
     snprintf(sql_buf, sizeof(sql_buf),
-             "UPDATE ai_column_p0_t1.task_shadow SET retry_count=%ld, state=%ld "
+             "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=%ld "
              "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
              "AND rowkey_predicate='%.*s'",
              new_retry, new_state, tenant_id, table_id, column_id,

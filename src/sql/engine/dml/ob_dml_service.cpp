@@ -2272,7 +2272,7 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
           } else if (!pk_str.empty()) {
             char sql_buf[1024];
             snprintf(sql_buf, sizeof(sql_buf),
-                     "DELETE FROM ai_column_p0_t1.task_shadow WHERE table_id=%ld AND rowkey_predicate='%.*s'",
+                     "DELETE FROM oceanbase.__all_ai_column_task WHERE table_id=%ld AND rowkey_predicate='%.*s'",
                      dml_ctdef.das_base_ctdef_.index_tid_, pk_str.length(), pk_str.ptr());
             if (OB_FAIL(op.execute_ai_task_sql(sql_buf))) {
               SQL_ENG_LOG(ERROR, "delete ai task failed", K(ret), K(sql_buf));
@@ -2308,7 +2308,7 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
                 if (!old_pk.empty()) {
                   char sql_del[1024];
                   snprintf(sql_del, sizeof(sql_del),
-                           "DELETE FROM ai_column_p0_t1.task_shadow WHERE table_id=%ld AND rowkey_predicate='%.*s'",
+                           "DELETE FROM oceanbase.__all_ai_column_task WHERE table_id=%ld AND rowkey_predicate='%.*s'",
                            dml_ctdef.das_base_ctdef_.index_tid_, old_pk.length(), old_pk.ptr());
                   int del_ret = op.execute_ai_task_sql(sql_del);
                   if (OB_FAIL(del_ret)) { ret = del_ret; }
@@ -2317,7 +2317,7 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
                   char sql_ins[1024];
                   int64_t request_id = ObTimeUtility::current_time();
                   snprintf(sql_ins, sizeof(sql_ins),
-                           "INSERT INTO ai_column_p0_t1.task_shadow "
+                           "INSERT INTO oceanbase.__all_ai_column_task "
                            "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
                            "SELECT %ld, %ld, column_id, '%.*s', %ld, 1, 0, now(6), 0 "
                            "FROM oceanbase.__all_ai_column WHERE table_id=%ld",
@@ -2405,7 +2405,7 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
       } else if (!pk_str.empty()) {
         char sql_buf[1024];
         snprintf(sql_buf, sizeof(sql_buf),
-                 "DELETE FROM ai_column_p0_t1.task_shadow WHERE table_id=%ld AND rowkey_predicate='%.*s'",
+                 "DELETE FROM oceanbase.__all_ai_column_task WHERE table_id=%ld AND rowkey_predicate='%.*s'",
                  dml_ctdef.das_base_ctdef_.index_tid_, pk_str.length(), pk_str.ptr());
         if (OB_FAIL(op.execute_ai_task_sql(sql_buf))) {
           SQL_ENG_LOG(ERROR, "delete ai task single row failed", K(ret), K(sql_buf));
@@ -2434,7 +2434,7 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
             if (!old_pk.empty()) {
               char sql_del[1024];
               snprintf(sql_del, sizeof(sql_del),
-                       "DELETE FROM ai_column_p0_t1.task_shadow WHERE table_id=%ld AND rowkey_predicate='%.*s'",
+                       "DELETE FROM oceanbase.__all_ai_column_task WHERE table_id=%ld AND rowkey_predicate='%.*s'",
                        dml_ctdef.das_base_ctdef_.index_tid_, old_pk.length(), old_pk.ptr());
               if (OB_FAIL(op.execute_ai_task_sql(sql_del))) {
               }
@@ -2446,7 +2446,7 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
                 char sql_ins[1024];
                 int64_t request_id = ObTimeUtility::current_time();
                 snprintf(sql_ins, sizeof(sql_ins),
-                         "INSERT INTO ai_column_p0_t1.task_shadow "
+                         "INSERT INTO oceanbase.__all_ai_column_task "
                          "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
                          "VALUES (%ld,%ld,%ld,'%.*s',%ld,1,0,now(6),0)",
                          lib::current_resource_owner_id(), dml_ctdef.das_base_ctdef_.index_tid_,

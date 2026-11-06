@@ -492,7 +492,7 @@ int ObTableInsertOp::write_ai_task_fk_style()
     for (int64_t j = 0; OB_SUCC(ret) && j < ai_column_ids_.count(); ++j) {
       char sql_buf[1024];
       snprintf(sql_buf, sizeof(sql_buf),
-          "INSERT INTO ai_column_p0_t1.task_shadow "
+          "INSERT INTO oceanbase.__all_ai_column_task "
           "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
           "VALUES (%ld,%ld,%ld,'%.*s',%ld,1,0,now(6),0) "
           "ON DUPLICATE KEY UPDATE request_id=%ld, state=1, retry_count=0, eligible_ts=now(6)",
