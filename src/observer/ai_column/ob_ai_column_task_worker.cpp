@@ -110,8 +110,6 @@ int ObAIColumnTaskWorker::process_one_task(
   char sql_buf[2048];
   char prompt_buf[4096];
   int64_t prompt_len = 0;
-  fprintf(stderr, "[AI_WORKER] process_one_task ENTER tid=%ld tid2=%ld cid=%ld\n",
-          tenant_id, table_id, column_id); fflush(stderr);
 
   // 1. 查 __all_ai_column 拿 model_name + normalized_expr + max_retries
   ObString model_name, normalized_expr;
@@ -209,8 +207,6 @@ int ObAIColumnTaskWorker::process_one_task(
           OB_LOG(WARN, "query endpoint failed", K(ret));
         } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
           ret = OB_ENTRY_NOT_EXIST;
-          fprintf(stderr, "[AI_WORKER] endpoint not found, model_name=%.*s\n",
-                  model_name.length(), model_name.ptr()); fflush(stderr);
           OB_LOG(WARN, "endpoint not found", K(ret), K(model_name));
         } else {
           ObString tmp_url, tmp_model;
@@ -254,8 +250,6 @@ int ObAIColumnTaskWorker::process_one_task(
         if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(alloc, body_str, req_obj))) {
           OB_LOG(WARN, "parse request json failed", K(ret));
         } else if (OB_FAIL(client.send_post(alloc, ep_url, headers, req_obj, resp_obj))) {
-          fprintf(stderr, "[AI_WORKER] send_post failed ret=%d url=%.*s\n",
-                  ret, ep_url.length(), ep_url.ptr()); fflush(stderr);
           OB_LOG(WARN, "send_post failed", K(ret));
         } else if (OB_ISNULL(resp_obj)) {
           ret = OB_ERR_UNEXPECTED;
@@ -271,8 +265,6 @@ int ObAIColumnTaskWorker::process_one_task(
     }
   }
 
-  fprintf(stderr, "[AI_WORKER] before writeback, ret=%d ai_result_len=%ld\n",
-          ret, ai_result.length()); fflush(stderr);
   // 6. 写回真实结果（SQL 转义：\ 和 ' 都双写）
   if (OB_SUCC(ret) && !ai_result.empty()) {
     char sql_escaped[16384];
