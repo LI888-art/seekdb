@@ -1,5 +1,7 @@
 #define USING_LOG_PREFIX SERVER
 #include "ob_ai_column_task_worker.h"
+#include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
+#include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/allocator/ob_allocator.h"
 #include "common/mysqlclient/ob_mysql_proxy.h"
@@ -165,18 +167,85 @@ int ObAIColumnTaskWorker::process_one_task(
     }
   }
 
-  // 5. 写回（占位：tags='{}'）
+  // 5. 调真实模型（Mock HTTP）
+  ObString ai_result;
   if (OB_SUCC(ret)) {
+    ObString ep_url, ep_req_model;
+    {
+      SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+        snprintf(sql_buf, sizeof(sql_buf),
+                 "SELECT url, request_model_name "
+                 "FROM oceanbase.__all_ai_model_endpoint WHERE ai_model_name='%.*s'",
+                 model_name.length(), model_name.ptr());
+        if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+          OB_LOG(WARN, "query endpoint failed", K(ret));
+        } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+          ret = OB_ENTRY_NOT_EXIST;
+          OB_LOG(WARN, "endpoint not found", K(ret), K(model_name));
+        } else {
+          ObString tmp_url, tmp_model;
+          res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_url);
+          res.get_result()->get_varchar(static_cast<int64_t>(1), tmp_model);
+          ob_write_string(alloc, tmp_url, ep_url);
+          ob_write_string(alloc, tmp_model, ep_req_model);
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      ObAIFuncClient client;
+      ObArray<ObString> headers;
+      headers.push_back(ObString::make_string("Content-Type"));
+      headers.push_back(ObString::make_string("application/json"));
+      headers.push_back(ObString::make_string("Authorization"));
+      headers.push_back(ObString::make_string("Bearer p0-key"));
+      if (OB_FAIL(client.init(alloc, ep_url, headers))) {
+        OB_LOG(WARN, "client init failed", K(ret));
+      } else {
+        ObString body_str;
+        body_str = ObString::make_string("{\"model\":\"mock-complete\",\"messages\":[{\"role\":\"user\",\"content\":\"test\"}]}");
+        ObJsonObject *req_obj = nullptr;
+        ObJsonObject *resp_obj = nullptr;
+        if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(alloc, body_str, req_obj))) {
+          OB_LOG(WARN, "parse request json failed", K(ret));
+        } else if (OB_FAIL(client.send_post(alloc, ep_url, headers, req_obj, resp_obj))) {
+          OB_LOG(WARN, "send_post failed", K(ret));
+        } else if (OB_ISNULL(resp_obj)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          // 直接取响应 JSON 的字符串
+          ObString resp_str;
+          if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(alloc, resp_obj, resp_str))) {
+          } else {
+            ob_write_string(alloc, resp_str, ai_result);
+          }
+        }
+      }
+    }
+  }
+
+  // 6. 写回真实结果（单引号用 ASCII 39，避免转义）
+  if (OB_SUCC(ret) && !ai_result.empty()) {
+    char escaped[8192];
+    int64_t esc_pos = 0;
+    for (int64_t i = 0; i < ai_result.length() && esc_pos < (int64_t)sizeof(escaped) - 2; ++i) {
+      char c = ai_result.ptr()[i];
+      escaped[esc_pos++] = c;
+      if (39 == c) {
+        escaped[esc_pos++] = c;
+      }
+    }
+    escaped[esc_pos] = 0;
     snprintf(sql_buf, sizeof(sql_buf),
-             "UPDATE ai_column_p0_t1.docs SET tags='{}' WHERE %.*s",
-             rowkey_predicate.length(), rowkey_predicate.ptr());
+             "UPDATE ai_column_p0_t1.docs SET tags='%s' WHERE %.*s",
+             escaped, rowkey_predicate.length(), rowkey_predicate.ptr());
     int64_t affected = 0;
     if (OB_FAIL(sql_proxy_->write(sql_buf, affected))) {
       OB_LOG(WARN, "writeback failed", K(ret), K(sql_buf));
     }
   }
 
-  // 6. 成功删任务 / 失败重试
+  // 7. 成功删任务 / 失败重试
   if (OB_SUCC(ret)) {
     snprintf(sql_buf, sizeof(sql_buf),
              "DELETE FROM ai_column_p0_t1.task_shadow "
