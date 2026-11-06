@@ -18,8 +18,9 @@
 
 #include "config_bridge.h"
 #include "sql/engine/dml/ob_table_insert_op.h"
+#include "lib/rc/ob_rc.h"
+#include "lib/time/ob_time_utility.h"
 #include "sql/engine/dml/ob_dml_service.h"
-
 
 namespace oceanbase
 {
@@ -226,6 +227,14 @@ OB_INLINE int ObTableInsertOp::insert_row_to_das()
                                                                 tablet_loc->tablet_id_,
                                                                 eval_ctx_))) {
       } else if (OB_FAIL(ObDMLService::insert_row(ins_ctdef, ins_rtdef, tablet_loc, dml_rtctx_, modify_row.new_row_))) {
+      } else if (0 == j && OB_FAIL(collect_ai_task_pk(ins_ctdef))) {
+        SQL_ENG_LOG(ERROR, "failed to collect ai task pk", K(ret));
+      } else if (0 == j && !pending_pk_strs_.empty()) {
+        SQL_ENG_LOG(ERROR, "insert_row_to_das ai branch, pending_cnt", K(pending_pk_strs_.count()));
+        set_need_ai_task_processing();
+        if (OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
+          SQL_ENG_LOG(ERROR, "push modify_row for ai task failed", K(ret));
+        }
       } else if (need_after_row_process(ins_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
       }
       if (OB_FAIL(ret)) {
@@ -392,6 +401,108 @@ OB_INLINE int ObTableInsertOp::close_table_for_each()
   return ret;
 }
 
+int ObTableInsertOp::collect_ai_task_pk(const ObInsCtDef &ins_ctdef)
+{
+  int ret = OB_SUCCESS;
+  SQL_ENG_LOG(ERROR, "collect_ai_task_pk ENTER", K(ins_ctdef.das_base_ctdef_.index_tid_));
+  ObSchemaGetterGuard *schema_guard = ctx_.get_sql_ctx()->schema_guard_;
+  const ObTableSchema *table_schema = nullptr;
+  if (OB_ISNULL(schema_guard)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_guard->get_table_schema(ins_ctdef.das_base_ctdef_.index_tid_, table_schema))) {
+  } else if (OB_ISNULL(table_schema) || table_schema->is_sys_table()) {
+    // skip: 系统表不生成任务
+  } else {
+    // 判断是否有 AI 列（找以 __state_ 开头的隐藏列，防止嵌套递归）
+    bool has_ai_col = false;
+    for (auto iter = table_schema->column_begin();
+         !has_ai_col && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *col = *iter;
+      if (OB_NOT_NULL(col) && col->is_hidden()) {
+        const ObString &name = col->get_column_name_str();
+        if (name.length() > 8 && 0 == strncmp(name.ptr(), "__state_", 8)) {
+          has_ai_col = true;
+          // 从 __state_<ai_col> 反查 AI 列的 column_id
+          ObString ai_col_name(name.length() - 8, name.ptr() + 8);
+          const ObColumnSchemaV2 *ai_col = table_schema->get_column_schema(ai_col_name);
+          if (OB_NOT_NULL(ai_col)) {
+            ai_column_id_ = ai_col->get_column_id();
+          }
+        }
+      }
+    }
+    SQL_ENG_LOG(ERROR, "collect_ai_task_pk has_ai_col", K(has_ai_col), K(table_schema->get_table_id()), K(table_schema->get_table_name_str()));
+    if (!has_ai_col) {
+      return OB_SUCCESS; // 非 AI 表（如 task 表自己）直接跳过，防死锁
+    }
+
+    current_table_id_ = table_schema->get_table_id();
+    current_tenant_id_ = lib::current_resource_owner_id();
+    char buf[1024];
+    int64_t pos = 0;
+    bool first = true;
+    ObSEArray<uint64_t, 4> pk_col_ids;
+    if (OB_FAIL(table_schema->get_rowkey_column_ids(pk_col_ids))) {
+    } else {
+      SQL_ENG_LOG(ERROR, "collect_ai_task_pk pk_col_ids", K(pk_col_ids.count()));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < pk_col_ids.count(); ++i) {
+      uint64_t pk_col_id = pk_col_ids.at(i);
+      int64_t expr_idx = -1;
+      for (int64_t k = 0; k < ins_ctdef.column_ids_.count(); ++k) {
+        if (ins_ctdef.column_ids_.at(k) == pk_col_id) { expr_idx = k; break; }
+      }
+      const ObColumnSchemaV2 *col_schema = table_schema->get_column_schema(pk_col_id);
+      if (expr_idx >= 0 && OB_NOT_NULL(col_schema)) {
+        ObExpr *expr = ins_ctdef.new_row_.at(expr_idx);
+        ObDatum *datum = nullptr;
+        if (OB_FAIL(expr->eval(eval_ctx_, datum))) {
+        } else if (OB_NOT_NULL(datum)) {
+          ObObj obj;
+          if (OB_FAIL(datum->to_obj(obj, expr->obj_meta_))) {
+          } else if (!first && OB_FAIL(databuff_printf(buf, sizeof(buf), pos, " AND "))) {
+          } else if (FALSE_IT(first = false)) {
+          } else if (OB_FAIL(databuff_printf(buf, sizeof(buf), pos, "`%.*s` = ", col_schema->get_column_name_str().length(), col_schema->get_column_name_str().ptr()))) {
+          } else if (OB_FAIL(obj.print_sql_literal(buf, sizeof(buf), pos, obj_print_params_))) {
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !first) {
+      ObString pk_str;
+      if (OB_FAIL(ob_write_string(ctx_.get_allocator(), ObString(pos, buf), pk_str))) {
+      } else if (OB_FAIL(pending_pk_strs_.push_back(pk_str))) {
+      } else {
+        SQL_ENG_LOG(ERROR, "collect_ai_task_pk pushed", K(pending_pk_strs_.count()), K(pk_str));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableInsertOp::write_ai_task_fk_style()
+{
+  int ret = OB_SUCCESS;
+  if (pending_pk_strs_.empty()) {
+    return OB_SUCCESS;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < pending_pk_strs_.count(); ++i) {
+    ObString pk_str = pending_pk_strs_.at(i);
+    char sql_buf[1024];
+    int64_t request_id = ObTimeUtility::current_time();
+    snprintf(sql_buf, sizeof(sql_buf),
+        "INSERT INTO ai_column_p0_t1.task_shadow "
+        "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
+        "VALUES (%ld,%ld,%ld,'%.*s',%ld,1,0,now(6),0)",
+        lib::current_resource_owner_id(), current_table_id_, ai_column_id_,
+        pk_str.length(), pk_str.ptr(), request_id);
+    if (OB_FAIL(execute_ai_task_sql(sql_buf))) {
+      SQL_ENG_LOG(ERROR, "execute_ai_task_sql failed", K(ret), K(sql_buf));
+    }
+  }
+  pending_pk_strs_.reset();
+  return ret;
+}
 
 }  // namespace sql
 }  // namespace oceanbase

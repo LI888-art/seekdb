@@ -230,6 +230,8 @@ public:
   int begin_nested_session(bool skip_cur_stmt_tables);
   int end_nested_session();
   int execute_write(const char *sql);
+  int execute_ai_task_sql(const char *sql);
+  int check_ai_column(const ObDMLBaseCtDef &ctdef, bool &has_ai_col);
   int execute_read(const char *sql, common::ObMySQLProxy::MySQLResult &res);
   int check_stack();
   bool is_nested_session() { return ObSQLUtils::is_nested_sql(&ctx_); }
@@ -238,7 +240,9 @@ public:
   bool has_before_row_trigger(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_before_row(); }
   bool has_after_row_trigger(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_after_row(); }
   bool need_foreign_key_check(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.fk_args_.count() > 0; }
-  bool need_after_row_process(const ObDMLBaseCtDef &dml_ctdef) { return need_foreign_key_check(dml_ctdef) || has_after_row_trigger(dml_ctdef); }
+  bool need_after_row_process(const ObDMLBaseCtDef &dml_ctdef) { return need_foreign_key_check(dml_ctdef) || has_after_row_trigger(dml_ctdef) || need_ai_task_processing_; }
+  void set_need_ai_task_processing() { need_ai_task_processing_ = true; }
+  void reset_need_ai_task_processing() { need_ai_task_processing_ = false; }
   void set_execute_single_row() { execute_single_row_ = true; }
   void unset_execute_single_row() { execute_single_row_ = false; }
   bool get_execute_single_row() const { return execute_single_row_; }
@@ -253,6 +257,7 @@ public:
   int submit_all_dml_task();
 
   int perform_batch_fk_check();
+  bool need_ai_task_processing_ = false;
 protected:
   OperatorOpenOrder get_operator_open_order() const;
   virtual int inner_open();

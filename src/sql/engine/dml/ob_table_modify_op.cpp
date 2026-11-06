@@ -987,6 +987,55 @@ int ObTableModifyOp::end_nested_session()
   }
   return ret;
 }
+int ObTableModifyOp::check_ai_column(const ObDMLBaseCtDef &ctdef, bool &has_ai_col)
+{
+  int ret = OB_SUCCESS;
+  has_ai_col = false;
+  ObSchemaGetterGuard *schema_guard = get_exec_ctx().get_sql_ctx()->schema_guard_;
+  const ObTableSchema *table_schema = nullptr;
+  if (OB_ISNULL(schema_guard)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_guard->get_table_schema(ctdef.das_base_ctdef_.index_tid_, table_schema))) {
+  } else if (OB_ISNULL(table_schema) || table_schema->is_sys_table()) {
+  } else {
+    for (auto iter = table_schema->column_begin();
+         !has_ai_col && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *col = *iter;
+      if (OB_NOT_NULL(col) && col->is_hidden()) {
+        const ObString &name = col->get_column_name_str();
+        if (name.length() > 8 && 0 == strncmp(name.ptr(), "__state_", 8)) {
+          has_ai_col = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableModifyOp::execute_ai_task_sql(const char *sql)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(inner_conn_) && OB_FAIL(open_inner_conn())) {
+  } else if (OB_ISNULL(inner_conn_)) {
+    ret = OB_NOT_INIT;
+  } else {
+    bool save_fk = get_exec_ctx().get_das_ctx().is_fk_cascading_;
+  bool save_ignore = get_exec_ctx().get_das_ctx().in_ignore_cascading_;
+  get_exec_ctx().get_das_ctx().is_fk_cascading_ = true;
+  get_exec_ctx().get_das_ctx().in_ignore_cascading_ = false;
+  if (OB_FAIL(begin_nested_session(false))) {
+  } else {
+    if (OB_FAIL(execute_write(sql))) {
+    }
+    int tmp = end_nested_session();
+    if (OB_SUCCESS != tmp && OB_SUCC(ret)) ret = tmp;
+  }
+    get_exec_ctx().get_das_ctx().is_fk_cascading_ = save_fk;
+    get_exec_ctx().get_das_ctx().in_ignore_cascading_ = save_ignore;
+  }
+  return ret;
+}
+
 int ObTableModifyOp::execute_write(const char *sql)
 {
   int ret = OB_SUCCESS;

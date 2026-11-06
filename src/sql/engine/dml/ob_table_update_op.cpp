@@ -182,6 +182,12 @@ int ObTableUpdateOp::inner_switch_iterator()
 int ObTableUpdateOp::write_row_to_das_buffer()
 {
   int ret = OB_SUCCESS;
+  if (!need_ai_task_processing_ && MY_SPEC.upd_ctdefs_.count() > 0 && MY_SPEC.upd_ctdefs_.at(0).count() > 0) {
+    bool has_ai = false;
+    if (OB_SUCC(check_ai_column(*MY_SPEC.upd_ctdefs_.at(0).at(0), has_ai)) && has_ai) {
+      set_need_ai_task_processing();
+    }
+  }
   ret = update_row_to_das();
   return ret;
 }

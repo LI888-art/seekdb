@@ -223,6 +223,12 @@ OB_INLINE int ObTableDeleteOp::calc_tablet_loc(const ObDelCtDef &del_ctdef,
 int ObTableDeleteOp::write_row_to_das_buffer()
 {
   int ret = OB_SUCCESS;
+  if (!need_ai_task_processing_ && MY_SPEC.del_ctdefs_.count() > 0 && MY_SPEC.del_ctdefs_.at(0).count() > 0) {
+    bool has_ai = false;
+    if (OB_SUCC(check_ai_column(*MY_SPEC.del_ctdefs_.at(0).at(0), has_ai)) && has_ai) {
+      set_need_ai_task_processing();
+    }
+  }
   ret = delete_row_to_das();
   return ret;
 }

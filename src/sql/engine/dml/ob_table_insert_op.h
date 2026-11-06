@@ -69,6 +69,8 @@ private:
 class ObTableInsertOp : public ObTableModifyOp
 {
 public:
+  int64_t ai_column_id_ = 0;
+  int write_ai_task_fk_style();
   typedef common::ObArrayWrap<ObInsRtDef> InsRtDefArray;
   typedef common::ObArrayWrap<InsRtDefArray> InsRtDef2DArray;
   ObTableInsertOp(ObExecContext &ctx, const ObOpSpec &spec, ObOpInput *input)
@@ -95,7 +97,11 @@ protected:
   int check_insert_affected_row();
   virtual void record_err_for_load_data(int err_ret, int row_num) override;
   virtual int check_need_exec_single_row() override;
+  int collect_ai_task_pk(const ObInsCtDef &ins_ctdef);
 protected:
+  common::ObSEArray<common::ObString, 8> pending_pk_strs_;
+  int64_t current_table_id_;
+  uint64_t current_tenant_id_;
   InsRtDef2DArray ins_rtdefs_; //see the comment of InsCtDef2DArray
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTableInsertOp);
