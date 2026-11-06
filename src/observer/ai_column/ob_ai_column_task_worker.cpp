@@ -400,7 +400,10 @@ int ObAIColumnTaskWorker::process_one_task(
     int64_t affected = 0;
     if (OB_FAIL(sql_proxy_->write(sql_buf, affected))) {
       OB_LOG(WARN, "writeback failed", K(ret), K(sql_buf));
-    } else {
+    } else if (0 == affected) {
+      // 行已被 DELETE，放弃本次结果，清理任务
+      OB_LOG(INFO, "row gone, discard result", K(table_id), K(column_id));
+      ret = OB_ENTRY_NOT_EXIST;
     }
   }
 
