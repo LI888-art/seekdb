@@ -111,6 +111,24 @@ int ObAIColumnTaskWorker::process_one_task(
   char prompt_buf[4096];
   int64_t prompt_len = 0;
 
+  // 0. 查表名（动态）
+  ObString table_name;
+  {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "SELECT table_name FROM oceanbase.__all_table WHERE table_id=%ld", table_id);
+      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+        OB_LOG(WARN, "query table_name failed", K(ret), K(table_id));
+      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+        ret = OB_ENTRY_NOT_EXIST;
+      } else {
+        ObString tmp_table;
+        res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_table);
+        ob_write_string(alloc, tmp_table, table_name);
+      }
+    }
+  }
+
   // 1. 查 __all_ai_column 拿 model_name + normalized_expr + max_retries
   ObString model_name, normalized_expr;
   int64_t max_retries = 2;
@@ -143,7 +161,8 @@ int ObAIColumnTaskWorker::process_one_task(
   if (OB_SUCC(ret)) {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       snprintf(sql_buf, sizeof(sql_buf),
-               "SELECT content FROM ai_column_p0_t1.docs WHERE %.*s",
+               "SELECT content FROM ai_column_p0_t1.%.*s WHERE %.*s",
+               table_name.length(), table_name.ptr(),
                rowkey_predicate.length(), rowkey_predicate.ptr());
       if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
         OB_LOG(WARN, "query docs content failed", K(ret), K(sql_buf));
@@ -228,18 +247,32 @@ int ObAIColumnTaskWorker::process_one_task(
       if (OB_FAIL(client.init(alloc, ep_url, headers))) {
         OB_LOG(WARN, "client init failed", K(ret));
       } else {
-        // 用真实 prompt 拼 body（转义后拼接）
+        // 判断端点类型：embeddings 还是 chat/completions
+        bool is_embedding_ep = (nullptr != strstr(ep_url.ptr(), "/embeddings"));
         char model_esc[512];
-        char prompt_esc[8192];
         int64_t model_esc_len = json_escape_for_http(ep_req_model.ptr(), ep_req_model.length(),
                                                      model_esc, sizeof(model_esc));
-        int64_t prompt_esc_len = json_escape_for_http(prompt_buf, prompt_len,
-                                                      prompt_esc, sizeof(prompt_esc));
         char body_buf[16384];
-        int64_t body_len = snprintf(body_buf, sizeof(body_buf),
-            "{\"model\":\"%.*s\",\"messages\":[{\"role\":\"user\",\"content\":\"%.*s\"}]}",
-            (int)model_esc_len, model_esc,
-            (int)prompt_esc_len, prompt_esc);
+        int64_t body_len = 0;
+        if (is_embedding_ep) {
+          // embeddings: {"model":"...","input":"<content>"}
+          char content_esc[8192];
+          int64_t content_esc_len = json_escape_for_http(content.ptr(), content.length(),
+                                                         content_esc, sizeof(content_esc));
+          body_len = snprintf(body_buf, sizeof(body_buf),
+              "{\"model\":\"%.*s\",\"input\":\"%.*s\"}",
+              (int)model_esc_len, model_esc,
+              (int)content_esc_len, content_esc);
+        } else {
+          // chat/completions: {"model":"...","messages":[...]}
+          char prompt_esc[8192];
+          int64_t prompt_esc_len = json_escape_for_http(prompt_buf, prompt_len,
+                                                        prompt_esc, sizeof(prompt_esc));
+          body_len = snprintf(body_buf, sizeof(body_buf),
+              "{\"model\":\"%.*s\",\"messages\":[{\"role\":\"user\",\"content\":\"%.*s\"}]}",
+              (int)model_esc_len, model_esc,
+              (int)prompt_esc_len, prompt_esc);
+        }
         if (body_len <= 0 || body_len >= (int64_t)sizeof(body_buf)) {
           ret = OB_SIZE_OVERFLOW;
           OB_LOG(WARN, "body too long", K(ret), K(body_len));
@@ -247,16 +280,35 @@ int ObAIColumnTaskWorker::process_one_task(
         ObString body_str(body_len, body_buf);
         ObJsonObject *req_obj = nullptr;
         ObJsonObject *resp_obj = nullptr;
-        if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(alloc, body_str, req_obj))) {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(alloc, body_str, req_obj))) {
           OB_LOG(WARN, "parse request json failed", K(ret));
         } else if (OB_FAIL(client.send_post(alloc, ep_url, headers, req_obj, resp_obj))) {
           OB_LOG(WARN, "send_post failed", K(ret));
         } else if (OB_ISNULL(resp_obj)) {
           ret = OB_ERR_UNEXPECTED;
         } else {
-          // 直接取响应 JSON 的字符串
           ObString resp_str;
           if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(alloc, resp_obj, resp_str))) {
+          } else if (is_embedding_ep) {
+            // 解析 data[0].embedding 数组 -> [v1,v2,v3,v4]
+            const char *emb_pos = strstr(resp_str.ptr(), "\"embedding\"");
+            const char *lb = (nullptr != emb_pos) ? strchr(emb_pos, '[') : nullptr;
+            const char *rb = (nullptr != lb) ? strchr(lb, ']') : nullptr;
+            if (nullptr == lb || nullptr == rb) {
+              ret = OB_ERR_UNEXPECTED;
+              OB_LOG(WARN, "parse embedding array failed", K(ret), K(resp_str));
+            } else {
+              int64_t vec_len = rb - lb + 1;
+              char vec_buf[512];
+              if (vec_len >= (int64_t)sizeof(vec_buf)) {
+                ret = OB_SIZE_OVERFLOW;
+              } else {
+                memcpy(vec_buf, lb, vec_len);
+                vec_buf[vec_len] = 0;
+                ob_write_string(alloc, ObString(vec_len, vec_buf), ai_result);
+              }
+            }
           } else {
             ob_write_string(alloc, resp_str, ai_result);
           }
@@ -282,9 +334,32 @@ int ObAIColumnTaskWorker::process_one_task(
       }
     }
     sql_escaped[esc_pos] = 0;
-    snprintf(sql_buf, sizeof(sql_buf),
-             "UPDATE ai_column_p0_t1.docs SET tags='%s' WHERE %.*s",
-             sql_escaped, rowkey_predicate.length(), rowkey_predicate.ptr());
+    // 按 column_id 查列名
+    ObString col_name;
+    {
+      SMART_VAR(ObMySQLProxy::MySQLResult, res2) {
+        snprintf(sql_buf, sizeof(sql_buf),
+                 "SELECT column_name FROM oceanbase.__all_column "
+                 "WHERE table_id=%ld AND column_id=%ld", table_id, column_id);
+        if (OB_SUCC(sql_proxy_->read(res2, sql_buf))
+            && OB_NOT_NULL(res2.get_result())
+            && OB_SUCCESS == res2.get_result()->next()) {
+          ObString tmp_col;
+          res2.get_result()->get_varchar(static_cast<int64_t>(0), tmp_col);
+          ob_write_string(alloc, tmp_col, col_name);
+        }
+      }
+    }
+    if (col_name.empty()) {
+      ret = OB_ENTRY_NOT_EXIST;
+      OB_LOG(WARN, "column_name not found", K(ret), K(table_id), K(column_id));
+    } else {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "UPDATE ai_column_p0_t1.%.*s SET %.*s='%s' WHERE %.*s",
+               table_name.length(), table_name.ptr(),
+               col_name.length(), col_name.ptr(),
+               sql_escaped, rowkey_predicate.length(), rowkey_predicate.ptr());
+    }
     int64_t affected = 0;
     if (OB_FAIL(sql_proxy_->write(sql_buf, affected))) {
       OB_LOG(WARN, "writeback failed", K(ret), K(sql_buf));

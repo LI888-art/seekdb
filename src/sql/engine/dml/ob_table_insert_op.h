@@ -69,7 +69,7 @@ private:
 class ObTableInsertOp : public ObTableModifyOp
 {
 public:
-  int64_t ai_column_id_ = 0;
+  common::ObSEArray<int64_t, 4> ai_column_ids_;
   int write_ai_task_fk_style();
   typedef common::ObArrayWrap<ObInsRtDef> InsRtDefArray;
   typedef common::ObArrayWrap<InsRtDefArray> InsRtDef2DArray;

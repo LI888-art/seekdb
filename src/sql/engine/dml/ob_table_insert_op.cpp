@@ -413,27 +413,26 @@ int ObTableInsertOp::collect_ai_task_pk(const ObInsCtDef &ins_ctdef)
   } else if (OB_ISNULL(table_schema) || table_schema->is_sys_table()) {
     // skip: 系统表不生成任务
   } else {
-    // 判断是否有 AI 列（找以 __state_ 开头的隐藏列，防止嵌套递归）
-    bool has_ai_col = false;
+    // 收集所有 AI 列的 column_id（找 __state_ 开头的隐藏列）
+    ai_column_ids_.reset();
     for (auto iter = table_schema->column_begin();
-         !has_ai_col && iter != table_schema->column_end(); ++iter) {
+         iter != table_schema->column_end(); ++iter) {
       const ObColumnSchemaV2 *col = *iter;
       if (OB_NOT_NULL(col) && col->is_hidden()) {
         const ObString &name = col->get_column_name_str();
         if (name.length() > 8 && 0 == strncmp(name.ptr(), "__state_", 8)) {
-          has_ai_col = true;
-          // 从 __state_<ai_col> 反查 AI 列的 column_id
           ObString ai_col_name(name.length() - 8, name.ptr() + 8);
           const ObColumnSchemaV2 *ai_col = table_schema->get_column_schema(ai_col_name);
-          if (OB_NOT_NULL(ai_col)) {
-            ai_column_id_ = ai_col->get_column_id();
+          if (OB_NOT_NULL(ai_col) && OB_FAIL(ai_column_ids_.push_back(ai_col->get_column_id()))) {
+            SQL_ENG_LOG(WARN, "push ai_column_id failed", K(ret));
           }
         }
       }
     }
-    SQL_ENG_LOG(ERROR, "collect_ai_task_pk has_ai_col", K(has_ai_col), K(table_schema->get_table_id()), K(table_schema->get_table_name_str()));
-    if (!has_ai_col) {
-      return OB_SUCCESS; // 非 AI 表（如 task 表自己）直接跳过，防死锁
+    SQL_ENG_LOG(WARN, "collect_ai_task_pk ai_cols", K(ai_column_ids_.count()),
+                K(table_schema->get_table_id()));
+    if (ai_column_ids_.empty()) {
+      return OB_SUCCESS;
     }
 
     current_table_id_ = table_schema->get_table_id();
@@ -483,24 +482,30 @@ int ObTableInsertOp::collect_ai_task_pk(const ObInsCtDef &ins_ctdef)
 int ObTableInsertOp::write_ai_task_fk_style()
 {
   int ret = OB_SUCCESS;
-  if (pending_pk_strs_.empty()) {
+  if (pending_pk_strs_.empty() || ai_column_ids_.empty()) {
     return OB_SUCCESS;
   }
+  // 同一个 request_id 用于同一次变更的所有 AI 列（分组提交语义）
+  int64_t request_id = ObTimeUtility::current_time();
   for (int64_t i = 0; OB_SUCC(ret) && i < pending_pk_strs_.count(); ++i) {
     ObString pk_str = pending_pk_strs_.at(i);
-    char sql_buf[1024];
-    int64_t request_id = ObTimeUtility::current_time();
-    snprintf(sql_buf, sizeof(sql_buf),
-        "INSERT INTO ai_column_p0_t1.task_shadow "
-        "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
-        "VALUES (%ld,%ld,%ld,'%.*s',%ld,1,0,now(6),0)",
-        lib::current_resource_owner_id(), current_table_id_, ai_column_id_,
-        pk_str.length(), pk_str.ptr(), request_id);
-    if (OB_FAIL(execute_ai_task_sql(sql_buf))) {
-      SQL_ENG_LOG(ERROR, "execute_ai_task_sql failed", K(ret), K(sql_buf));
+    for (int64_t j = 0; OB_SUCC(ret) && j < ai_column_ids_.count(); ++j) {
+      char sql_buf[1024];
+      snprintf(sql_buf, sizeof(sql_buf),
+          "INSERT INTO ai_column_p0_t1.task_shadow "
+          "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
+          "VALUES (%ld,%ld,%ld,'%.*s',%ld,1,0,now(6),0) "
+          "ON DUPLICATE KEY UPDATE request_id=%ld, state=1, retry_count=0, eligible_ts=now(6)",
+          lib::current_resource_owner_id(), current_table_id_, ai_column_ids_.at(j),
+          pk_str.length(), pk_str.ptr(), request_id,
+          request_id);
+      if (OB_FAIL(execute_ai_task_sql(sql_buf))) {
+        SQL_ENG_LOG(WARN, "execute_ai_task_sql failed", K(ret), K(sql_buf));
+      }
     }
   }
   pending_pk_strs_.reset();
+  ai_column_ids_.reset();
   return ret;
 }
 
