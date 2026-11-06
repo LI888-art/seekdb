@@ -73,6 +73,7 @@
 #include "storage/ob_disk_usage_reporter.h"
 #include "storage/tx_storage/ob_access_service.h"
 #include "logservice/ob_server_log_block_mgr.h"
+#include "observer/ai_column/ob_ai_column_task_worker.h"
 
 
 
@@ -481,6 +482,7 @@ private:
   obmysql::ObDiag diag_;
   common::ObMysqlRandom scramble_rand_;
   common::ObTimer server_gtimer_;
+  ObAIColumnTaskWorker ai_column_task_worker_;
   common::ObTimer sql_mem_timer_;
   common::ObTimer ctas_clean_up_timer_;
   ObServerDutyTask duty_task_;

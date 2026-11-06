@@ -2194,6 +2194,13 @@ int ObServer::init_server_runtime()
     }
   }
 
+  // 注册 AI 列任务 worker（2s 间隔）
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(ai_column_task_worker_.init(&sql_proxy_))) {
+    } else if (OB_FAIL(server_gtimer_.schedule(ai_column_task_worker_, 2000000, true))) {
+    }
+  }
+
   return ret;
 }
 
