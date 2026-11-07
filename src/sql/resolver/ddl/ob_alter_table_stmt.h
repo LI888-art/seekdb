@@ -104,6 +104,18 @@ public:
     alter_table_arg_.lock_session_create_ts_ = create_ts;
   }
   void set_lock_priority();
+
+  // ========== RETRY AI COLUMN ==========
+  void set_retry_ai_column(const common::ObString &col_name,
+                           const common::ObString &where_sql) {
+    has_retry_ai_column_ = true;
+    retry_ai_column_name_ = col_name;
+    retry_where_sql_ = where_sql;
+  }
+  bool has_retry_ai_column() const { return has_retry_ai_column_; }
+  const common::ObString &get_retry_ai_column_name() const { return retry_ai_column_name_; }
+  const common::ObString &get_retry_where_sql() const { return retry_where_sql_; }
+
 private:
   obcall::ObAlterTableArg alter_table_arg_;
   bool is_comment_table_;
@@ -114,6 +126,10 @@ private:
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;
+  // RETRY AI COLUMN
+  bool has_retry_ai_column_;
+  common::ObString retry_ai_column_name_;
+  common::ObString retry_where_sql_;
 };
 
 inline int ObAlterTableStmt::set_tz_info_wrap(const common::ObTimeZoneInfoWrap &tz_info_wrap)

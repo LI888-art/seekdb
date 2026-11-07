@@ -588,6 +588,12 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
             }
             break;
         }
+        case T_ALTER_TABLE_RETRY_AI_COLUMN: {
+            if (OB_FAIL(resolve_retry_ai_column(*action_node))) {
+              SQL_RESV_LOG(WARN, "failed to resolve retry ai column", K(ret));
+            }
+            break;
+        }
         default: {
             ret = OB_ERR_UNEXPECTED;
             SQL_RESV_LOG(WARN, "Unknown alter table action %d", K_(action_node->type), K(ret));
@@ -596,6 +602,13 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
           }
         }
       }
+    }
+    // RETRY AI COLUMN 混用检查（所有 action 解析完后统一检查）
+    if (OB_SUCC(ret) && alter_table_stmt->has_retry_ai_column()
+        && alter_table_stmt->get_alter_table_action_count() > 1) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "RETRY AI COLUMN cannot be mixed with other actions");
+      SQL_RESV_LOG(WARN, "RETRY AI COLUMN cannot be mixed with other actions", K(ret));
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(check_skip_index(alter_table_stmt->get_alter_table_arg().alter_table_schema_))) {
@@ -4508,6 +4521,37 @@ int ObAlterTableResolver::resolve_modify_all_trigger(const ParseNode &node)
       OX (new_tg_arg.set_trigger_id(table_schema_->get_trigger_list().at(i)));
       OZ (alter_table_stmt->get_tg_arg().trigger_infos_.push_back(new_tg_arg));
       LOG_DEBUG("alter table all triggers", K(new_tg_arg.get_trigger_id()), K(ret));
+    }
+  }
+  return ret;
+}
+
+
+int ObAlterTableResolver::resolve_retry_ai_column(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  if (OB_ISNULL(alter_table_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_UNLIKELY(2 != node.num_child_) || OB_ISNULL(node.children_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid RETRY AI COLUMN parse node", K(ret), K(node.num_child_));
+  } else if (OB_ISNULL(node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid AI column name node", K(ret));
+  } else {
+    ParseNode *col_node = node.children_[0];
+    ObString col_name(col_node->str_len_, col_node->str_value_);
+    ObString tmp_col;
+    ObString where_sql;
+    if (OB_FAIL(ob_write_string(*allocator_, col_name, tmp_col))) {
+      SQL_RESV_LOG(WARN, "copy col name failed", K(ret));
+    } else if (OB_NOT_NULL(node.str_value_) && node.str_len_ > 0
+               && OB_FAIL(ob_write_string(*allocator_, ObString(node.str_len_, node.str_value_), where_sql))) {
+      SQL_RESV_LOG(WARN, "copy where sql failed", K(ret));
+    } else {
+      alter_table_stmt->set_retry_ai_column(tmp_col, where_sql);
+      SQL_RESV_LOG(INFO, "set retry ai column", K(tmp_col), K(where_sql));
     }
   }
   return ret;

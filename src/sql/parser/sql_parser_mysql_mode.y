@@ -14806,6 +14806,9 @@ opt_set table_option_list_space_seperated
 | RETRY AI_COLUMN NAME_OB opt_where
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE_RETRY_AI_COLUMN, 2, $3, $4);
+  if (NULL != $4) {
+    dup_expr_string($$, result, @4.first_column, @4.last_column);
+  }
 }
 |
 DROP CONSTRAINT constraint_name

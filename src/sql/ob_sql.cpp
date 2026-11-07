@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
+#include "lib/rc/ob_rc.h"
+#include "sql/resolver/ddl/ob_alter_table_stmt.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "lib/json/ob_json_print_utils.h"
@@ -177,6 +179,106 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                                               ObSchemaGetterGuard *schema_guard,
                                               ObMySQLProxy *sql_proxy);
 
+static int execute_retry_ai_column(ObAlterTableStmt *alter_stmt,
+                                   ObSQLSessionInfo *session,
+                                   ObSchemaGetterGuard *schema_guard,
+                                   ObMySQLProxy *sql_proxy)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator alloc("retry_ai_col");
+  char sql_buf[16384];
+  if (OB_ISNULL(alter_stmt) || OB_ISNULL(session) || OB_ISNULL(schema_guard) || OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!alter_stmt->has_retry_ai_column()) {
+    // skip
+  } else {
+    const ObString &col_name = alter_stmt->get_retry_ai_column_name();
+    const ObString &where_sql = alter_stmt->get_retry_where_sql();
+    const ObString &db_name = alter_stmt->get_database_name();
+    const ObString &table_name = alter_stmt->get_table_name();
+    // 1. 查 __all_ai_column 验证是 AI 列 + 拿 table_id / column_id / state_col_id / result_col_id
+    int64_t table_id = 0, column_id = 0, state_col_id = 0, result_col_id = 0;
+    ObString result_col_name;
+    {
+      SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+        snprintf(sql_buf, sizeof(sql_buf),
+                 "SELECT ac.table_id, ac.column_id, ac.state_column_id, ac.result_spec_column_id, ac.column_name "
+                 "FROM oceanbase.__all_ai_column ac "
+                 "JOIN oceanbase.__all_table t ON ac.table_id = t.table_id "
+                 "JOIN oceanbase.__all_database d ON t.database_id = d.database_id "
+                 "WHERE d.database_name='%.*s' AND t.table_name='%.*s' AND ac.column_name='%.*s'",
+                 db_name.length(), db_name.ptr(),
+                 table_name.length(), table_name.ptr(),
+                 col_name.length(), col_name.ptr());
+        if (OB_FAIL(sql_proxy->read(res, sql_buf))) {
+          LOG_WARN("query ai_column meta failed", K(ret), K(sql_buf));
+        } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "RETRY on non AI column");
+          LOG_WARN("retry on non ai column", K(ret), K(col_name));
+        } else {
+          ObString tmp_cn;
+          res.get_result()->get_int(static_cast<int64_t>(0), table_id);
+          res.get_result()->get_int(static_cast<int64_t>(1), column_id);
+          res.get_result()->get_int(static_cast<int64_t>(2), state_col_id);
+          res.get_result()->get_int(static_cast<int64_t>(3), result_col_id);
+          res.get_result()->get_varchar(static_cast<int64_t>(4), tmp_cn);
+          ob_write_string(alloc, tmp_cn, result_col_name);
+        }
+      }
+    }
+    // 2. 拼 WHERE 条件（where_sql 是 "WHERE xxx" 或空）
+    ObString where_cond;
+    if (OB_SUCC(ret)) {
+      if (where_sql.empty()) {
+        where_cond = ObString::make_string("1=1");
+      } else if (where_sql.length() > 6 && 0 == strncasecmp(where_sql.ptr(), "WHERE ", 6)) {
+        where_cond = ObString(where_sql.length() - 6, where_sql.ptr() + 6);
+      } else {
+        where_cond = where_sql;
+      }
+    }
+    // 3. 清空 result 列（让严格读取能检测到未就绪）
+    if (OB_SUCC(ret)) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "UPDATE %.*s.%.*s SET %.*s=NULL WHERE %.*s",
+               db_name.length(), db_name.ptr(),
+               table_name.length(), table_name.ptr(),
+               result_col_name.length(), result_col_name.ptr(),
+               where_cond.length(), where_cond.ptr());
+      int64_t affected = 0;
+      if (OB_FAIL(sql_proxy->write(sql_buf, affected))) {
+        LOG_WARN("clear result failed", K(ret), K(sql_buf));
+      } else {
+        LOG_INFO("clear result affected", K(affected));
+      }
+    }
+    // 4. 重置/创建任务（让 worker 重新执行）
+    if (OB_SUCC(ret)) {
+      int64_t tenant_id = static_cast<int64_t>(lib::current_resource_owner_id());
+      int64_t request_id = ObTimeUtility::current_time();
+      snprintf(sql_buf, sizeof(sql_buf),
+               "INSERT INTO oceanbase.__all_ai_column_task "
+               "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
+               "SELECT %ld, %ld, %ld, CONCAT('`id` = ', id), %ld, 1, 0, now(6), 0 "
+               "FROM %.*s.%.*s WHERE %.*s "
+               "ON DUPLICATE KEY UPDATE request_id=%ld, state=1, retry_count=0, eligible_ts=now(6)",
+               tenant_id, table_id, column_id, request_id,
+               db_name.length(), db_name.ptr(),
+               table_name.length(), table_name.ptr(),
+               where_cond.length(), where_cond.ptr(),
+               request_id);
+      int64_t affected = 0;
+      if (OB_FAIL(sql_proxy->write(sql_buf, affected))) {
+        LOG_WARN("reset ai task failed", K(ret), K(sql_buf));
+      } else {
+        LOG_INFO("retry ai column executed", K(col_name), K(affected), K(tenant_id));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
@@ -204,6 +306,16 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
         context.schema_guard_,
         GCTX.sql_proxy_))) {
       LOG_WARN("strict read check failed", K(ret));
+    }
+  }
+  // RETRY AI COLUMN 执行（仅 ALTER TABLE）
+  if (OB_SUCC(ret) && OB_NOT_NULL(context.cur_stmt_)
+      && stmt::T_ALTER_TABLE == context.cur_stmt_->get_stmt_type()) {
+    ObAlterTableStmt *alter_stmt = static_cast<ObAlterTableStmt *>(context.cur_stmt_);
+    if (alter_stmt->has_retry_ai_column()) {
+      if (OB_FAIL(execute_retry_ai_column(alter_stmt, &result.get_session(), context.schema_guard_, GCTX.sql_proxy_))) {
+        LOG_WARN("execute retry ai column failed", K(ret));
+      }
     }
   }
   //LOG_DEBUG("result errno", N_ERR_CODE, result.get_errcode(), K(ret));
