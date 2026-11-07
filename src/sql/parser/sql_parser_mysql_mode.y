@@ -258,6 +258,7 @@ END_P SET_VAR DELIMITER
 
 //-----------------------------reserved keyword end-------------------------------------------------
 %token AI_COLUMN
+%token RETRY
 %token <non_reserved_keyword>
 //-----------------------------non_reserved keyword begin-------------------------------------------
         ACCESS ACCOUNT ACTION ACTIVE ADDDATE AFTER AGAINST AGGREGATE AI ALGORITHM ALWAYS ALLOW ANALYSE ANY
@@ -14801,6 +14802,10 @@ opt_set table_option_list_space_seperated
 | alter_foreign_key_action
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_FOREIGN_KEY_OPTION, 1, $1);
+}
+| RETRY AI_COLUMN NAME_OB opt_where
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE_RETRY_AI_COLUMN, 2, $3, $4);
 }
 |
 DROP CONSTRAINT constraint_name
