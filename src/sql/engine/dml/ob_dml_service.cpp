@@ -2305,6 +2305,48 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
               } else if (OB_FAIL(new_ret)) {
                 ret = new_ret;
               } else {
+                // 结果失效：AI 结果列置 NULL（同事务）
+                if (OB_SUCC(ret) && !old_pk.empty()) {
+                  ObSqlString null_sql;
+                  ObSchemaGetterGuard *sg = op.get_exec_ctx().get_sql_ctx()->schema_guard_;
+                  const ObTableSchema *ts = nullptr;
+                  const ObDatabaseSchema *db_schema = nullptr;
+                  if (OB_ISNULL(sg)
+                      || OB_FAIL(sg->get_table_schema(dml_ctdef.das_base_ctdef_.index_tid_, ts))
+                      || OB_ISNULL(ts)
+                      || OB_FAIL(sg->get_database_schema(ts->get_database_id(), db_schema))
+                      || OB_ISNULL(db_schema)) {
+                    ret = OB_ERR_UNEXPECTED;
+                  } else if (OB_FAIL(null_sql.append_fmt("UPDATE `%.*s`.`%.*s` SET ",
+                             db_schema->get_database_name_str().length(), db_schema->get_database_name_str().ptr(),
+                             ts->get_table_name_str().length(), ts->get_table_name_str().ptr()))) {
+                  } else {
+                    bool first_col = true;
+                    for (auto it = ts->column_begin(); OB_SUCC(ret) && it != ts->column_end(); ++it) {
+                      const ObColumnSchemaV2 *col = *it;
+                      if (OB_NOT_NULL(col) && col->is_hidden()) {
+                        const ObString &cn = col->get_column_name_str();
+                        if (cn.length() > 8 && 0 == strncmp(cn.ptr(), "__state_", 8)) {
+                          ObString ai_col(cn.length() - 8, cn.ptr() + 8);
+                          const ObColumnSchemaV2 *ac = ts->get_column_schema(ai_col);
+                          if (OB_NOT_NULL(ac)) {
+                            if (!first_col && OB_FAIL(null_sql.append(", "))) break;
+                            first_col = false;
+                            if (OB_FAIL(null_sql.append_fmt("`%.*s`=NULL",
+                                       ac->get_column_name_str().length(), ac->get_column_name_str().ptr()))) break;
+                          }
+                        }
+                      }
+                    }
+                    if (OB_SUCC(ret) && !first_col) {
+                      if (OB_FAIL(null_sql.append_fmt(" WHERE %.*s",
+                                 old_pk.length(), old_pk.ptr()))) {
+                      } else if (OB_FAIL(op.execute_ai_task_sql(null_sql.ptr()))) {
+                        SQL_ENG_LOG(WARN, "nullify ai columns failed", K(ret), K(null_sql));
+                      }
+                    }
+                  }
+                }
                 if (!old_pk.empty()) {
                   char sql_del[1024];
                   snprintf(sql_del, sizeof(sql_del),
@@ -2431,7 +2473,49 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
           if (OB_FAIL(extract_ai_pk_predicate(op, dml_ctdef, dml_ctdef.old_row_, tmp_alloc, old_pk))) {
           } else if (OB_FAIL(extract_ai_pk_predicate(op, dml_ctdef, dml_ctdef.new_row_, tmp_alloc, new_pk))) {
           } else {
-            if (!old_pk.empty()) {
+            // 结果失效：AI 结果列置 NULL（同事务）
+            if (OB_SUCC(ret) && !old_pk.empty()) {
+              ObSqlString null_sql;
+              ObSchemaGetterGuard *sg = op.get_exec_ctx().get_sql_ctx()->schema_guard_;
+              const ObTableSchema *ts = nullptr;
+              const ObDatabaseSchema *db_schema = nullptr;
+              if (OB_ISNULL(sg)
+                  || OB_FAIL(sg->get_table_schema(dml_ctdef.das_base_ctdef_.index_tid_, ts))
+                  || OB_ISNULL(ts)
+                  || OB_FAIL(sg->get_database_schema(ts->get_database_id(), db_schema))
+                  || OB_ISNULL(db_schema)) {
+                ret = OB_ERR_UNEXPECTED;
+              } else if (OB_FAIL(null_sql.append_fmt("UPDATE `%.*s`.`%.*s` SET ",
+                         db_schema->get_database_name_str().length(), db_schema->get_database_name_str().ptr(),
+                         ts->get_table_name_str().length(), ts->get_table_name_str().ptr()))) {
+              } else {
+                bool first_col = true;
+                for (auto it = ts->column_begin(); OB_SUCC(ret) && it != ts->column_end(); ++it) {
+                  const ObColumnSchemaV2 *col = *it;
+                  if (OB_NOT_NULL(col) && col->is_hidden()) {
+                    const ObString &cn = col->get_column_name_str();
+                    if (cn.length() > 8 && 0 == strncmp(cn.ptr(), "__state_", 8)) {
+                      ObString ai_col(cn.length() - 8, cn.ptr() + 8);
+                      const ObColumnSchemaV2 *ac = ts->get_column_schema(ai_col);
+                      if (OB_NOT_NULL(ac)) {
+                        if (!first_col && OB_FAIL(null_sql.append(", "))) break;
+                        first_col = false;
+                        if (OB_FAIL(null_sql.append_fmt("`%.*s`=NULL",
+                                   ac->get_column_name_str().length(), ac->get_column_name_str().ptr()))) break;
+                      }
+                    }
+                  }
+                }
+                if (OB_SUCC(ret) && !first_col) {
+                  if (OB_FAIL(null_sql.append_fmt(" WHERE %.*s", old_pk.length(), old_pk.ptr()))) {
+                  } else if (OB_FAIL(op.execute_ai_task_sql(null_sql.ptr()))) {
+                    SQL_ENG_LOG(WARN, "nullify ai columns single row failed", K(ret), K(null_sql));
+                  }
+                }
+              }
+            }
+            // 删旧任务 + 建新任务（多 AI 列）
+            if (OB_SUCC(ret) && !old_pk.empty()) {
               char sql_del[1024];
               snprintf(sql_del, sizeof(sql_del),
                        "DELETE FROM oceanbase.__all_ai_column_task WHERE table_id=%ld AND rowkey_predicate='%.*s'",
@@ -2440,19 +2524,17 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
               }
             }
             if (OB_SUCC(ret) && !new_pk.empty()) {
-              int64_t ai_col_id = 0;
-              if (OB_FAIL(extract_ai_column_id(op, dml_ctdef, ai_col_id))) {
-              } else {
-                char sql_ins[1024];
-                int64_t request_id = ObTimeUtility::current_time();
-                snprintf(sql_ins, sizeof(sql_ins),
-                         "INSERT INTO oceanbase.__all_ai_column_task "
-                         "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
-                         "VALUES (%ld,%ld,%ld,'%.*s',%ld,1,0,now(6),0)",
-                         lib::current_resource_owner_id(), dml_ctdef.das_base_ctdef_.index_tid_,
-                         ai_col_id, new_pk.length(), new_pk.ptr(), request_id);
-                if (OB_FAIL(op.execute_ai_task_sql(sql_ins))) {
-                }
+              char sql_ins[1024];
+              int64_t request_id = ObTimeUtility::current_time();
+              snprintf(sql_ins, sizeof(sql_ins),
+                       "INSERT INTO oceanbase.__all_ai_column_task "
+                       "(tenant_id, table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts, definition_version) "
+                       "SELECT %ld, %ld, column_id, '%.*s', %ld, 1, 0, now(6), 0 "
+                       "FROM oceanbase.__all_ai_column WHERE table_id=%ld",
+                       lib::current_resource_owner_id(), dml_ctdef.das_base_ctdef_.index_tid_,
+                       new_pk.length(), new_pk.ptr(), request_id,
+                       dml_ctdef.das_base_ctdef_.index_tid_);
+              if (OB_FAIL(op.execute_ai_task_sql(sql_ins))) {
               }
             }
           }
