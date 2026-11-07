@@ -2157,7 +2157,17 @@ static int extract_ai_pk_predicate(ObTableModifyOp &op,
     int64_t pos = 0;
     bool first = true;
     ObSEArray<uint64_t, 4> pk_col_ids;
-    if (OB_FAIL(table_schema->get_rowkey_column_ids(pk_col_ids))) {
+    // 优先从 ctdef.column_ids_ 里找第一个非隐藏列（HEAP 表主键是 __pk_increment 隐藏列）
+    for (int64_t k = 0; k < ctdef.column_ids_.count(); ++k) {
+      const ObColumnSchemaV2 *c = table_schema->get_column_schema(ctdef.column_ids_.at(k));
+      if (OB_NOT_NULL(c) && !c->is_hidden()) {
+        if (OB_FAIL(pk_col_ids.push_back(ctdef.column_ids_.at(k)))) {
+        }
+        break;
+      }
+    }
+    // 兜底：如果 ctdef 里找不到非隐藏列，用 rowkey（普通表）
+    if (pk_col_ids.empty() && OB_FAIL(table_schema->get_rowkey_column_ids(pk_col_ids))) {
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < pk_col_ids.count(); ++i) {
       uint64_t pk_col_id = pk_col_ids.at(i);
