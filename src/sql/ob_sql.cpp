@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
+#include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -151,7 +153,6 @@ void ObSql::bind_exec_context_runtime_services(ObExecContext &exec_ctx)
   exec_ctx.set_runtime_services(services);
 }
 
-
 int ObSql::stmt_prepare(const common::ObString &stmt,
                         ObSqlCtx &context,
                         ObResultSet &result,
@@ -229,7 +230,6 @@ int ObSql::stmt_execute(const ObPsStmtId stmt_id,
   }
   return ret;
 }
-
 
 int ObSql::fill_result_set(ObResultSet &result_set,
                            ObSqlCtx *context,
@@ -985,7 +985,6 @@ int ObSql::do_real_prepare(const ObString &sql,
   LOG_INFO("add ps cache", K(info_ctx.normalized_sql_), K(param_cnt), K(ret));
   return ret;
 }
-
 
 ObSql::TimeoutGuard::TimeoutGuard(ObSQLSessionInfo &session)
   : session_(session)
@@ -2019,6 +2018,128 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   return ret;
 }
 
+static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
+                                              ObSQLSessionInfo *session,
+                                              ObSchemaGetterGuard *schema_guard,
+                                              ObMySQLProxy *sql_proxy)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  if (OB_ISNULL(stmt) || OB_ISNULL(session) || OB_ISNULL(schema_guard) || OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session->get_bool_sys_var(SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+    LOG_WARN("get ai_column_strict_read failed", K(ret));
+  } else if (!strict_read) {
+    // OFF, skip
+  } else if (stmt->is_update_stmt()) {
+    // TODO: UPDATE 路径 sql_proxy_->read() 在 handle_physical_plan 内会卡住，
+    // 暂时跳过 UPDATE 的严格读取检查，等后续移到 executor 外层再补。
+  } else {
+    ObSEArray<ObRawExpr*, 32> user_exprs;
+    if (stmt->is_select_stmt()) {
+      ObSelectStmt *sel = static_cast<ObSelectStmt*>(stmt);
+      for (int64_t i = 0; i < sel->get_select_item_size(); ++i) {
+        ObRawExpr *e = sel->get_select_item(i).expr_;
+        if (OB_NOT_NULL(e)) { user_exprs.push_back(e); }
+      }
+      for (int64_t i = 0; i < sel->get_group_exprs().count(); ++i) {
+        user_exprs.push_back(sel->get_group_exprs().at(i));
+      }
+      for (int64_t i = 0; i < sel->get_having_exprs().count(); ++i) {
+        user_exprs.push_back(sel->get_having_exprs().at(i));
+      }
+    }
+    for (int64_t i = 0; i < stmt->get_condition_size(); ++i) {
+      user_exprs.push_back(stmt->get_condition_expr(i));
+    }
+    ObSEArray<ObRawExpr*, 32> col_exprs;
+    if (OB_FAIL(ObRawExprUtils::extract_column_exprs(user_exprs, col_exprs))) {
+      LOG_WARN("extract column exprs failed", K(ret));
+    } else {
+      const ObIArray<TableItem*> &table_items = stmt->get_table_items();
+      for (int64_t t = 0; OB_SUCC(ret) && t < table_items.count(); ++t) {
+        const TableItem *table = table_items.at(t);
+        if (OB_ISNULL(table) || !table->is_basic_table()) { continue; }
+        ObString db_name = table->database_name_;
+        if (db_name.empty() && OB_NOT_NULL(session)) {
+          db_name = session->get_database_name();
+        }
+        ObSqlString ac_sql;
+        if (OB_FAIL(ac_sql.append_fmt(
+              "SELECT ac.column_id, ac.state_column_id, ac.request_column_id, ac.result_spec_column_id "
+              "FROM oceanbase.__all_ai_column ac "
+              "JOIN oceanbase.__all_table t ON ac.table_id = t.table_id "
+              "JOIN oceanbase.__all_database d ON t.database_id = d.database_id "
+              "WHERE d.database_name='%.*s' AND t.table_name='%.*s'",
+              db_name.length(), db_name.ptr(),
+              table->table_name_.length(), table->table_name_.ptr()))) {
+          LOG_WARN("build ac_sql failed", K(ret));
+        } else {
+          SMART_VAR(ObMySQLProxy::MySQLResult, ac_res) {
+            if (OB_FAIL(sql_proxy->read(ac_res, ac_sql.ptr()))) {
+              LOG_WARN("query ai columns failed", K(ret));
+            } else if (OB_ISNULL(ac_res.get_result())) {
+            } else {
+              while (OB_SUCC(ret)) {
+                int next_ret = ac_res.get_result()->next();
+                if (OB_ITER_END == next_ret) { break; }
+                else if (OB_FAIL(next_ret)) { ret = next_ret; break; }
+                int64_t ac_id = 0, st_id = 0, rq_id = 0, rs_id = 0;
+                if (OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(0), ac_id))
+                    || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(1), st_id))
+                    || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(2), rq_id))
+                    || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(3), rs_id))) {
+                } else {
+                  bool referenced = false;
+                  for (int64_t c = 0; !referenced && c < col_exprs.count(); ++c) {
+                    ObRawExpr *ce = col_exprs.at(c);
+                    if (OB_ISNULL(ce) || !ce->is_column_ref_expr()) { continue; }
+                    uint64_t cid = static_cast<ObColumnRefRawExpr*>(ce)->get_column_id();
+                    if (cid == (uint64_t)ac_id || cid == (uint64_t)st_id
+                        || cid == (uint64_t)rq_id || cid == (uint64_t)rs_id) {
+                      referenced = true;
+                    }
+                  }
+                  if (!referenced) { continue; }
+                  ObSqlString task_sql;
+                  if (OB_FAIL(task_sql.append_fmt(
+                        "SELECT COUNT(*) FROM oceanbase.__all_ai_column_task "
+                        "WHERE table_id=(SELECT table_id FROM oceanbase.__all_table t "
+                        "JOIN oceanbase.__all_database d ON t.database_id=d.database_id "
+                        "WHERE d.database_name='%.*s' AND t.table_name='%.*s') "
+                        "AND column_id=%ld AND state != 3",
+                        db_name.length(), db_name.ptr(),
+                        table->table_name_.length(), table->table_name_.ptr(),
+                        ac_id))) {
+                    LOG_WARN("build task_sql failed", K(ret));
+                  } else {
+                    SMART_VAR(ObMySQLProxy::MySQLResult, task_res) {
+                      if (OB_FAIL(sql_proxy->read(task_res, task_sql.ptr()))) {
+                        LOG_WARN("query task count failed", K(ret));
+                      } else if (OB_ISNULL(task_res.get_result()) || OB_SUCCESS != task_res.get_result()->next()) {
+                      } else {
+                        int64_t task_count = 0;
+                        if (OB_FAIL(task_res.get_result()->get_int(static_cast<int64_t>(0), task_count))) {
+                        } else if (task_count > 0) {
+                          ret = OB_ERR_AI_COLUMN_NOT_READY;
+                          LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
+                        }
+                      }
+                    }
+                  }
+                  if (OB_FAIL(ret)) break;
+                }
+              }
+            }
+          }
+        }
+        if (OB_FAIL(ret)) break;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObSql::generate_stmt(ParseResult &parse_result,
                          ObPlanCacheCtx *pc_ctx,
                          ObSqlCtx &context,
@@ -2265,6 +2386,13 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
                                    outline_parse_result))) {
   } else if (OB_ISNULL(basic_stmt)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (basic_stmt->is_dml_stmt()
+             && OB_FAIL(check_ai_column_strict_read_exec(
+                   static_cast<ObDMLStmt*>(basic_stmt),
+                   sql_ctx.session_info_,
+                   sql_ctx.schema_guard_,
+                   GCTX.sql_proxy_))) {
+    LOG_WARN("check ai column strict read failed", K(ret));
     // begin/commit statement does not need to check privilege
   } else if (!is_begin_commit_stmt
           && OB_FAIL(ObPrivilegeCheck::check_privilege_new(sql_ctx,
@@ -3879,7 +4007,6 @@ void ObSql::generate_sql_id(ObPlanCacheCtx &pc_ctx,
   }
 }
 
-
 int ObSql::calc_pre_calculable_exprs(const ObDMLStmt &stmt,
                                  const ObIArray<ObHiddenColumnItem> &calculable_exprs,
                                  const bool is_ignore_stmt,
@@ -4108,7 +4235,6 @@ void ObSql::rollback_implicit_trans_when_fail(ObResultSet &result, int &ret)
     }
   }
 }
-
 
 }//end of namespace sql
 }//end of namespace oceanbase
