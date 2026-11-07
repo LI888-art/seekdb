@@ -656,6 +656,7 @@ int ObSysVarFactory::create_all_sys_vars_()
         + sizeof(ObSysVarRegexpTimeLimit)
         + sizeof(ObSysVarProfiling)
         + sizeof(ObSysVarProfilingHistorySize)
+        + sizeof(ObSysVarAiColumnStrictRead)
         + sizeof(ObSysVarObLogLevel)
         + sizeof(ObSysVarObQueryTimeout)
         + sizeof(ObSysVarObReadConsistency)
@@ -2174,6 +2175,15 @@ int ObSysVarFactory::create_all_sys_vars_()
       } else {
         store_buf_[share::ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(share::SYS_VAR_PROFILING_HISTORY_SIZE))] = sys_var_ptr;
         ptr = (void *)((char *)ptr + sizeof(ObSysVarProfilingHistorySize));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarAiColumnStrictRead())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarAiColumnStrictRead", K(ret));
+      } else {
+        store_buf_[share::ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(share::SYS_VAR_AI_COLUMN_STRICT_READ))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarAiColumnStrictRead));
       }
     }
     if (OB_SUCC(ret)) {
@@ -8184,6 +8194,10 @@ int ObSysVarFactory::create_sys_var(ObIAllocator &allocator_, share::ObSysVarCla
     }
     case share::SYS_VAR_PROFILING_HISTORY_SIZE: {
       ret = create_one_sys_var<ObSysVarProfilingHistorySize>(allocator_, sys_var_ptr, "ObSysVarProfilingHistorySize");
+      break;
+    }
+    case share::SYS_VAR_AI_COLUMN_STRICT_READ: {
+      ret = create_one_sys_var<ObSysVarAiColumnStrictRead>(allocator_, sys_var_ptr, "ObSysVarAiColumnStrictRead");
       break;
     }
     case share::SYS_VAR_OB_LOG_LEVEL: {
