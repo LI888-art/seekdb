@@ -518,7 +518,7 @@ public:
   bool need_match_all_params_; //only used for matching plans
   common::ObIArray<ObLocalSessionVar> *all_local_session_vars_; //store the old values of session vars which have changed after creating generated columns
   bool is_ddl_from_primary_;//DDL SQL statements from the primary cluster that need to be processed
-  const sql::ObStmt *cur_stmt_;
+  sql::ObStmt *cur_stmt_;
   const ObPhysicalPlan *cur_plan_;
 
   bool is_sensitive_;    // whether it contains sensitive information, if so, do not record in sql_audit

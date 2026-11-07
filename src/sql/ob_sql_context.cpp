@@ -163,6 +163,7 @@ void ObSqlCtx::reset()
 {
   multi_stmt_item_.reset();
   session_info_ = NULL;
+  cur_stmt_ = NULL;
   schema_guard_ = NULL;
   plan_cache_hit_ = false;
   self_add_plan_ = false;

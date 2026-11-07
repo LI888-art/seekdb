@@ -172,6 +172,11 @@ int ObSql::stmt_prepare(const common::ObString &stmt,
   return ret;
 }
 
+static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
+                                              ObSQLSessionInfo *session,
+                                              ObSchemaGetterGuard *schema_guard,
+                                              ObMySQLProxy *sql_proxy);
+
 int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
@@ -189,6 +194,16 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
   if (OB_FAIL(sanity_check(context))) {
   } else if (OB_FAIL(handle_text_query(stmt, context, result))) {
     if (OB_EAGAIN != ret) {
+    }
+  }
+  // AI column strict read check, after plan generated, before execution
+  if (OB_SUCC(ret) && OB_NOT_NULL(context.cur_stmt_) && context.cur_stmt_->is_dml_stmt()) {
+    if (OB_FAIL(check_ai_column_strict_read_exec(
+        static_cast<ObDMLStmt*>(context.cur_stmt_),
+        &result.get_session(),
+        context.schema_guard_,
+        GCTX.sql_proxy_))) {
+      LOG_WARN("strict read check failed", K(ret));
     }
   }
   //LOG_DEBUG("result errno", N_ERR_CODE, result.get_errcode(), K(ret));
@@ -238,6 +253,9 @@ int ObSql::fill_result_set(ObResultSet &result_set,
 {
   int ret = OB_SUCCESS;
   ObStmt *stmt = &basic_stmt;
+  if (OB_NOT_NULL(context)) {
+    context->cur_stmt_ = &basic_stmt;
+  }
   ObExecContext &ectx = result_set.get_exec_context();
   ObPhysicalPlanCtx *pctx = ectx.get_physical_plan_ctx();
   if (OB_UNLIKELY(NULL == context) || OB_UNLIKELY(NULL == context->session_info_) || OB_UNLIKELY(NULL == pctx)) {
@@ -2031,9 +2049,6 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
     LOG_WARN("get ai_column_strict_read failed", K(ret));
   } else if (!strict_read) {
     // OFF, skip
-  } else if (stmt->is_update_stmt()) {
-    // TODO: UPDATE 路径 sql_proxy_->read() 在 handle_physical_plan 内会卡住，
-    // 暂时跳过 UPDATE 的严格读取检查，等后续移到 executor 外层再补。
   } else {
     ObSEArray<ObRawExpr*, 32> user_exprs;
     if (stmt->is_select_stmt()) {
@@ -2386,14 +2401,6 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
                                    outline_parse_result))) {
   } else if (OB_ISNULL(basic_stmt)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (basic_stmt->is_dml_stmt()
-             && OB_FAIL(check_ai_column_strict_read_exec(
-                   static_cast<ObDMLStmt*>(basic_stmt),
-                   sql_ctx.session_info_,
-                   sql_ctx.schema_guard_,
-                   GCTX.sql_proxy_))) {
-    LOG_WARN("check ai column strict read failed", K(ret));
-    // begin/commit statement does not need to check privilege
   } else if (!is_begin_commit_stmt
           && OB_FAIL(ObPrivilegeCheck::check_privilege_new(sql_ctx,
                                                            basic_stmt,
