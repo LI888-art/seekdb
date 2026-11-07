@@ -6208,6 +6208,9 @@ column_attribute:
 AI_COLUMN '(' expr ')' opt_ai_column_options
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_DEFINITION, 2, $3, $5);
+  if (NULL != $3) {
+    dup_expr_string($3, result, @3.first_column, @3.last_column);
+  }
 }
 | not NULLX
 {

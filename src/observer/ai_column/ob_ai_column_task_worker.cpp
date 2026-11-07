@@ -128,8 +128,6 @@ int ObAIColumnTaskWorker::process_one_task(
   int ret = OB_SUCCESS;
   ObArenaAllocator alloc("ai_worker");
   char sql_buf[16384];
-  char prompt_buf[4096];
-  int64_t prompt_len = 0;
 
   // 0. 查表名 + 库名（动态）
   ObString table_name, database_name;
@@ -204,14 +202,39 @@ int ObAIColumnTaskWorker::process_one_task(
     }
   }
 
-  // 3. 拼 prompt
+  // 3. 拆分提示词和依赖表达式
+  ObString prompt;
+  ObString dep_expr;
+  ObString user_text;
   if (OB_SUCC(ret)) {
-    prompt_len = snprintf(prompt_buf, sizeof(prompt_buf), "%.*s\n%.*s",
-                          normalized_expr.length(), normalized_expr.ptr(),
-                          content.length(), content.ptr());
-    if (prompt_len <= 0 || prompt_len >= (int64_t)sizeof(prompt_buf)) {
-      ret = OB_SIZE_OVERFLOW;
-      OB_LOG(WARN, "prompt too long", K(ret), K(prompt_len));
+    const char *sep = safe_memmem(normalized_expr.ptr(), normalized_expr.length(), "|||", 3);
+    if (NULL == sep) {
+      prompt = normalized_expr;
+    } else {
+      const int64_t prompt_len = sep - normalized_expr.ptr();
+      prompt.assign_ptr(normalized_expr.ptr(), static_cast<int32_t>(prompt_len));
+      dep_expr.assign_ptr(sep + 3, static_cast<int32_t>(normalized_expr.length() - prompt_len - 3));
+    }
+    user_text = content;
+  }
+  if (OB_SUCC(ret) && !dep_expr.empty()) {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "SELECT %.*s FROM %.*s.%.*s WHERE %.*s",
+               dep_expr.length(), dep_expr.ptr(),
+               database_name.length(), database_name.ptr(),
+               table_name.length(), table_name.ptr(),
+               rowkey_predicate.length(), rowkey_predicate.ptr());
+      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+        OB_LOG(WARN, "query ai column dependency expression failed", K(ret), K(sql_buf));
+      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+        ret = OB_ENTRY_NOT_EXIST;
+      } else {
+        ObString tmp_user_text;
+        if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_user_text))) {
+        } else if (OB_FAIL(ob_write_string(alloc, tmp_user_text, user_text))) {
+        }
+      }
     }
   }
 
@@ -292,14 +315,19 @@ int ObAIColumnTaskWorker::process_one_task(
               (int)model_esc_len, model_esc,
               (int)content_esc_len, content_esc);
         } else {
-          // chat/completions: {"model":"...","messages":[...]}
+          // chat/completions: system carries the normalized prompt, user carries evaluated data.
           char prompt_esc[8192];
-          int64_t prompt_esc_len = json_escape_for_http(prompt_buf, prompt_len,
+          char user_esc[8192];
+          int64_t prompt_esc_len = json_escape_for_http(prompt.ptr(), prompt.length(),
                                                         prompt_esc, sizeof(prompt_esc));
+          int64_t user_esc_len = json_escape_for_http(user_text.ptr(), user_text.length(),
+                                                      user_esc, sizeof(user_esc));
           body_len = snprintf(body_buf, sizeof(body_buf),
-              "{\"model\":\"%.*s\",\"messages\":[{\"role\":\"user\",\"content\":\"%.*s\"}]}",
+              "{\"model\":\"%.*s\",\"messages\":[{\"role\":\"system\",\"content\":\"%.*s\"},"
+              "{\"role\":\"user\",\"content\":\"%.*s\"}]}",
               (int)model_esc_len, model_esc,
-              (int)prompt_esc_len, prompt_esc);
+              (int)prompt_esc_len, prompt_esc,
+              (int)user_esc_len, user_esc);
         }
         if (body_len <= 0 || body_len >= (int64_t)sizeof(body_buf)) {
           ret = OB_SIZE_OVERFLOW;
@@ -346,7 +374,20 @@ int ObAIColumnTaskWorker::process_one_task(
               }
             }
           } else {
-            ob_write_string(alloc, resp_str, ai_result);
+            ObIJsonBase *result_base = nullptr;
+            ObOpenAIUtils::ObOpenAIComplete openai_parser;
+            if (OB_FAIL(openai_parser.parse_output(
+                alloc, resp_obj, result_base))) {
+            } else if (OB_ISNULL(result_base)
+                       || ObJsonNodeType::J_STRING != result_base->json_type()) {
+              ret = OB_ERR_UNEXPECTED;
+              OB_LOG(WARN, "completion content is not a JSON string", K(ret), K(resp_str));
+            } else {
+              const ObJsonString *content_str =
+                  static_cast<const ObJsonString *>(result_base);
+              if (OB_FAIL(ob_write_string(alloc, content_str->get_str(), ai_result))) {
+              }
+            }
           }
         }
       }

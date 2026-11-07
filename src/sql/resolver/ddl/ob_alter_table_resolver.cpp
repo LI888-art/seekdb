@@ -35,6 +35,101 @@ using namespace common;
 using namespace obcall;
 namespace sql
 {
+
+static int extract_ai_column_dep_expr(const ParseNode *func_node,
+                                      ObIAllocator &allocator,
+                                      ObString &dep_expr)
+{
+  int ret = OB_SUCCESS;
+  dep_expr.reset();
+  if (OB_ISNULL(func_node) || func_node->str_len_ <= 0 || OB_ISNULL(func_node->str_value_)) {
+    // Old parse trees only contain the function AST.  Keep the legacy fallback.
+  } else {
+    const char *raw = func_node->str_value_;
+    const int64_t raw_len = func_node->str_len_;
+    int64_t open_pos = -1;
+    int64_t close_pos = -1;
+    int64_t depth = 0;
+    char quote = '\0';
+    bool escaped = false;
+    for (int64_t i = 0; OB_SUCC(ret) && i < raw_len; ++i) {
+      const char c = raw[i];
+      if ('\0' != quote) {
+        if (escaped) {
+          escaped = false;
+        } else if ('\\' == c) {
+          escaped = true;
+        } else if (quote == c) {
+          quote = '\0';
+        }
+      } else if ('\'' == c || '"' == c || '`' == c) {
+        quote = c;
+      } else if ('(' == c) {
+        if (-1 == open_pos) {
+          open_pos = i;
+        } else {
+          ++depth;
+        }
+      } else if (')' == c && open_pos >= 0) {
+        if (0 == depth) {
+          close_pos = i;
+          break;
+        } else {
+          --depth;
+        }
+      }
+    }
+    if (open_pos >= 0 && close_pos > open_pos) {
+      int64_t comma_pos[2] = {-1, -1};
+      int64_t arg_depth = 0;
+      int64_t comma_count = 0;
+      quote = '\0';
+      escaped = false;
+      for (int64_t i = open_pos + 1; i < close_pos; ++i) {
+        const char c = raw[i];
+        if ('\0' != quote) {
+          if (escaped) {
+            escaped = false;
+          } else if ('\\' == c) {
+            escaped = true;
+          } else if (quote == c) {
+            quote = '\0';
+          }
+        } else if ('\'' == c || '"' == c || '`' == c) {
+          quote = c;
+        } else if ('(' == c) {
+          ++arg_depth;
+        } else if (')' == c && arg_depth > 0) {
+          --arg_depth;
+        } else if (',' == c && 0 == arg_depth && comma_count < 2) {
+          comma_pos[comma_count++] = i;
+        }
+      }
+      if (comma_count >= 1) {
+        int64_t dep_begin = comma_pos[0] + 1;
+        int64_t dep_end = comma_count >= 2 ? comma_pos[1] : close_pos;
+        while (dep_begin < dep_end
+               && (' ' == raw[dep_begin] || '\t' == raw[dep_begin]
+                   || '\r' == raw[dep_begin] || '\n' == raw[dep_begin])) {
+          ++dep_begin;
+        }
+        while (dep_end > dep_begin
+               && (' ' == raw[dep_end - 1] || '\t' == raw[dep_end - 1]
+                   || '\r' == raw[dep_end - 1] || '\n' == raw[dep_end - 1])) {
+          --dep_end;
+        }
+        if (dep_end > dep_begin
+            && OB_FAIL(ob_write_string(allocator,
+                                       ObString(dep_end - dep_begin, raw + dep_begin),
+                                       dep_expr))) {
+          SQL_RESV_LOG(WARN, "failed to copy ai column dependency expression", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 ObAlterTableResolver::ObAlterTableResolver(ObResolverParams &params)
     : ObDDLResolver(params),
       table_schema_(NULL),
@@ -3588,7 +3683,18 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
                 if (OB_FAIL(ob_write_string(*allocator_, ObString(strlen(buf), buf), expr_str))) {
                 }
               }
-              if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator_, expr_str, ai_col.normalized_expr_))) {
+              ObString dep_expr;
+              if (OB_SUCC(ret) && OB_FAIL(extract_ai_column_dep_expr(
+                  ai_node->children_[0], *allocator_, dep_expr))) {
+              }
+              ObSqlString normalized_expr;
+              if (OB_SUCC(ret) && OB_FAIL(normalized_expr.append(expr_str))) {
+              } else if (OB_SUCC(ret) && !dep_expr.empty()
+                         && OB_FAIL(normalized_expr.append_fmt("|||%.*s",
+                                    dep_expr.length(), dep_expr.ptr()))) {
+              }
+              if (OB_SUCC(ret) && OB_FAIL(ob_write_string(
+                  *allocator_, normalized_expr.string(), ai_col.normalized_expr_))) {
               }
             }
             // add_ai_column (no hidden cols here)
