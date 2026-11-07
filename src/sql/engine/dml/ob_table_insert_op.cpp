@@ -441,19 +441,30 @@ int ObTableInsertOp::collect_ai_task_pk(const ObInsCtDef &ins_ctdef)
     int64_t pos = 0;
     bool first = true;
     ObSEArray<uint64_t, 4> pk_col_ids;
-    // 优先从 ctdef.column_ids_ 里找第一个非隐藏列（HEAP 表主键是 __pk_increment 隐藏列）
-    for (int64_t k = 0; k < ins_ctdef.column_ids_.count(); ++k) {
-      const ObColumnSchemaV2 *c = table_schema->get_column_schema(ins_ctdef.column_ids_.at(k));
-      if (OB_NOT_NULL(c) && !c->is_hidden()) {
-        if (OB_FAIL(pk_col_ids.push_back(ins_ctdef.column_ids_.at(k)))) {
-          SQL_ENG_LOG(WARN, "push pk_col_id failed", K(ret));
-        }
-        break;
-      }
-    }
-    // 兜底：如果 ctdef 里找不到非隐藏列，用 rowkey（普通表）
-    if (pk_col_ids.empty() && OB_FAIL(table_schema->get_rowkey_column_ids(pk_col_ids))) {
+    if (OB_FAIL(table_schema->get_rowkey_column_ids(pk_col_ids))) {
       SQL_ENG_LOG(WARN, "get_rowkey_column_ids failed", K(ret));
+    } else {
+      // 检查 rowkey 是否全为隐藏列（HEAP 表的 __pk_increment）
+      bool all_hidden = !pk_col_ids.empty();
+      for (int64_t i = 0; all_hidden && i < pk_col_ids.count(); ++i) {
+        const ObColumnSchemaV2 *c = table_schema->get_column_schema(pk_col_ids.at(i));
+        if (OB_NOT_NULL(c) && !c->is_hidden()) {
+          all_hidden = false;
+        }
+      }
+      if (all_hidden) {
+        // HEAP 表：回退到通过 column_flags 查找业务主键列
+        pk_col_ids.reset();
+        for (auto iter = table_schema->column_begin(); OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+          const ObColumnSchemaV2 *c = *iter;
+          if (OB_NOT_NULL(c) && !c->is_hidden()
+              && share::schema::is_heap_table_primary_key_column(c->get_column_flags())) {
+            if (OB_FAIL(pk_col_ids.push_back(c->get_column_id()))) {
+              SQL_ENG_LOG(WARN, "push pk_col_id failed", K(ret));
+            }
+          }
+        }
+      }
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < pk_col_ids.count(); ++i) {
       uint64_t pk_col_id = pk_col_ids.at(i);
