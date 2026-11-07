@@ -3444,57 +3444,62 @@ int ObDMLResolver::check_ai_column_strict_read(ObDMLStmt *stmt)
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_ISNULL(session_info = params_.session_info_)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(session_info->get_sys_variable(SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+  } else if (OB_FAIL(session_info->get_bool_sys_var(SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
     LOG_WARN("get ai_column_strict_read failed", K(ret));
   } else if (!strict_read) {
-    // strict read OFF, skip
+    // OFF, skip
   } else {
-    ObSEArray<ObColumnRefRawExpr*, 16> column_exprs;
-    if (OB_FAIL(stmt->get_column_exprs(column_exprs))) {
-      LOG_WARN("get column exprs failed", K(ret));
-    } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < column_exprs.count(); ++i) {
-        ObColumnRefRawExpr *col = column_exprs.at(i);
-        if (OB_ISNULL(col)) {
-          continue;
-        }
-        uint64_t table_id = col->get_table_id();
-        uint64_t column_id = col->get_column_id();
-        const ObTableSchema *table_schema = NULL;
-        bool is_ai_column = false;
-        if (OB_FAIL(schema_checker_->get_table_schema(table_id, table_schema))) {
-          // 表不在 schema checker（子查询临时表等），忽略
-          ret = OB_SUCCESS;
-        } else if (OB_NOT_NULL(table_schema)) {
-          const ObIArray<ObAIColumnSchema> &ai_cols = table_schema->get_ai_columns();
-          for (int64_t j = 0; j < ai_cols.count(); ++j) {
-            if (ai_cols.at(j).column_id_ == column_id) {
-              is_ai_column = true;
-              break;
-            }
+    const ObIArray<ColumnItem> &column_items = stmt->get_column_items();
+    const ObIArray<TableItem*> &table_items = stmt->get_table_items();
+    for (int64_t t = 0; OB_SUCC(ret) && t < table_items.count(); ++t) {
+      const TableItem *table = table_items.at(t);
+      if (OB_ISNULL(table) || !table->is_basic_table()) {
+        continue;
+      }
+      uint64_t table_id = table->table_id_;
+      if (OB_INVALID_ID == table_id) {
+        continue;
+      }
+      const ObTableSchema *table_schema = NULL;
+      if (OB_FAIL(schema_checker_->get_table_schema(table_id, table_schema))) {
+        ret = OB_SUCCESS;
+        continue;
+      }
+      if (OB_ISNULL(table_schema)) {
+        continue;
+      }
+      const ObIArray<ObAIColumnSchema> &ai_cols = table_schema->get_ai_columns();
+      for (int64_t a = 0; OB_SUCC(ret) && a < ai_cols.count(); ++a) {
+        uint64_t ai_col_id = ai_cols.at(a).column_id_;
+        bool referenced = false;
+        for (int64_t c = 0; c < column_items.count(); ++c) {
+          if (column_items.at(c).column_id_ == ai_col_id) {
+            referenced = true;
+            break;
           }
         }
-        if (OB_SUCC(ret) && is_ai_column) {
-          ObSqlString sql;
-          if (OB_FAIL(sql.append_fmt(
-                "SELECT COUNT(*) FROM oceanbase.__all_ai_column_task "
-                "WHERE table_id=%lu AND column_id=%lu AND state != 3",
-                table_id, column_id))) {
-            LOG_WARN("build task count sql failed", K(ret));
-          } else {
-            SMART_VAR(ObMySQLProxy::MySQLResult, res) {
-              if (OB_FAIL(params_.sql_proxy_->read(res, sql.ptr()))) {
-                LOG_WARN("query task count failed", K(ret));
-              } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
-                // 无结果，跳过
-              } else {
-                int64_t task_count = 0;
-                if (OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(0), task_count))) {
-                  LOG_WARN("get task count failed", K(ret));
-                } else if (task_count > 0) {
-                  ret = OB_ERR_AI_COLUMN_NOT_READY;
-                  LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
-                }
+        if (!referenced) {
+          continue;
+        }
+        ObSqlString sql;
+        if (OB_FAIL(sql.append_fmt(
+              "SELECT COUNT(*) FROM oceanbase.__all_ai_column_task "
+              "WHERE table_id=%lu AND column_id=%lu AND state != 3",
+              table_id, ai_col_id))) {
+          LOG_WARN("build task count sql failed", K(ret));
+        } else {
+          SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+            if (OB_FAIL(params_.sql_proxy_->read(res, sql.ptr()))) {
+              LOG_WARN("query task count failed", K(ret));
+            } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+              // no result
+            } else {
+              int64_t task_count = 0;
+              if (OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(0), task_count))) {
+                LOG_WARN("get task count failed", K(ret));
+              } else if (task_count > 0) {
+                ret = OB_ERR_AI_COLUMN_NOT_READY;
+                LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
               }
             }
           }

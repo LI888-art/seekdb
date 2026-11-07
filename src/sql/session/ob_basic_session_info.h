@@ -428,6 +428,7 @@ public:
 
   // Request delivery is bound to the single server runtime.
   int set_autocommit(bool autocommit);
+  int get_bool_sys_var(const share::ObSysVarClassType sys_var_id, bool &bool_val) const;
   int get_autocommit(bool &autocommit) const
   {
     autocommit = sys_vars_cache_.get_autocommit();
@@ -1175,7 +1176,7 @@ private:
                                               common::ObObj &new_val);
   int get_int64_sys_var(const share::ObSysVarClassType sys_var_id, int64_t &int64_val) const;
   int get_uint64_sys_var(const share::ObSysVarClassType sys_var_id, uint64_t &uint64_val) const;
-  int get_bool_sys_var(const share::ObSysVarClassType sys_var_id, bool &bool_val) const;
+
   int get_charset_sys_var(share::ObSysVarClassType sys_var_id, common::ObCharsetType &cs_type) const;
   int get_collation_sys_var(share::ObSysVarClassType sys_var_id, common::ObCollationType &coll_type) const;
   int get_string_sys_var(share::ObSysVarClassType sys_var_id, common::ObString &str) const;

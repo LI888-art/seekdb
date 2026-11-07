@@ -1051,9 +1051,8 @@ int ObSelectResolver::resolve(const ParseNode &parse_tree)
       }
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(check_ai_column_strict_read(select_stmt))) {
-    LOG_WARN("check ai column strict read failed", K(ret));
-  }
+  // NOTE: check_ai_column_strict_read 暂不调用，resolver 阶段 sql_proxy_->read()
+  // 会触发内部 SQL 重入，导致线程池死锁。待移到 ObSql::handle_text_query 执行前阶段。
 
   return ret;
 }
