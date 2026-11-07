@@ -188,6 +188,7 @@ public:
   inline ObDMLResolver *get_parent_namespace_resolver() { return parent_namespace_resolver_; }
   inline ObColumnNamespaceChecker& get_column_namespace_checker() { return column_namespace_checker_; }
   virtual int resolve_column_ref_for_subquery(const ObQualifiedName &q_name, ObRawExpr *&real_ref_expr);
+  int check_ai_column_strict_read(ObDMLStmt *stmt);
   int resolve_generated_column_expr(const common::ObString &expr_str,
                                     const TableItem &table_item,
                                     const share::schema::ObColumnSchemaV2 *column_schema,
