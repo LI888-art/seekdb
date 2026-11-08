@@ -13910,8 +13910,8 @@ static const _error _error_OB_ERR_AI_COLUMN_NOT_READY = {
       .error_solution        = "AI column has pending tasks or failed results",
       .mysql_errno           = -1,
       .sqlstate              = "HY000",
-      .str_error             = "AI column is not ready for strict read",
-      .str_user_error        = "AI column is not ready for strict read"
+      .str_error             = "AI column has unfinished tasks for table_id=%ld, column_id=%ld",
+      .str_user_error        = "AI column has unfinished tasks for table_id=%ld, column_id=%ld"
 };
 static const _error _error_OB_CLOB_ONLY_SUPPORT_WITH_MULTIBYTE_FUN = {
       .error_name            = "OB_CLOB_ONLY_SUPPORT_WITH_MULTIBYTE_FUN",
