@@ -2287,8 +2287,9 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                     }
                     ObString state_col_str(static_cast<int32_t>(state_col_name_len),
                                            state_col_name);
-                    OB_LOG(WARN, "state check debug", K(ac_id), K(state_col_str),
-                           K(not_ready_count), K(task_count));
+                    fprintf(stderr, "[FIX] state_check ac_id=%ld col=%.*s task=%ld not_ready=%ld\n",
+                            ac_id, state_col_str.length(), state_col_str.ptr(),
+                            task_count, not_ready_count); fflush(stderr);
                     if (OB_SUCC(ret) && (task_count > 0 || not_ready_count > 0)) {
                       ret = OB_ERR_AI_COLUMN_NOT_READY;
                       LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);

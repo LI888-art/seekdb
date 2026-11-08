@@ -490,8 +490,9 @@ int ObAIColumnTaskWorker::process_one_task(
           }
         }
       }
-      OB_LOG(WARN, "worker terminal fail debug",
-             K(ret), K(state_ret), K(state_affected), K(sql_buf), K(rowkey_predicate));
+      fprintf(stderr, "[FIX] terminal col=%.*s ret=%d state_ret=%d affected=%ld sql=%s\n",
+              state_column_name.length(), state_column_name.ptr(),
+              ret, state_ret, state_affected, sql_buf); fflush(stderr);
       if (OB_SUCCESS == state_ret) {
         snprintf(sql_buf, sizeof(sql_buf),
                  "DELETE FROM oceanbase.__all_ai_column_task "
