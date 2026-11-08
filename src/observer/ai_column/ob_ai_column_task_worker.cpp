@@ -862,8 +862,6 @@ int ObAIColumnTaskWorker::execute_one_task(
   // 7. 成功结果等待组发布 / 失败重试
   if (OB_SUCC(ret)) {
     // Successful results stay state=2 until process_tasks() publishes the group.
-  } else if (OB_ENTRY_NOT_EXIST == ret) {
-    ret = OB_SUCCESS;
   } else {
     int64_t new_retry = retry_count + 1;
     OB_LOG(WARN, "worker non-success branch", K(ret), K(new_retry), K(max_retries));
