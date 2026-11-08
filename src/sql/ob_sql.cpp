@@ -2193,10 +2193,13 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
         }
         ObSqlString ac_sql;
         if (OB_FAIL(ac_sql.append_fmt(
-              "SELECT ac.column_id, ac.state_column_id, ac.request_column_id, ac.result_spec_column_id "
+              "SELECT ac.column_id, ac.state_column_id, ac.request_column_id, ac.result_spec_column_id, "
+              "state_col.column_name "
               "FROM oceanbase.__all_ai_column ac "
               "JOIN oceanbase.__all_table t ON ac.table_id = t.table_id "
               "JOIN oceanbase.__all_database d ON t.database_id = d.database_id "
+              "JOIN oceanbase.__all_column state_col ON state_col.table_id = ac.table_id "
+              "AND state_col.column_id = ac.state_column_id "
               "WHERE d.database_name='%.*s' AND t.table_name='%.*s'",
               db_name.length(), db_name.ptr(),
               table->table_name_.length(), table->table_name_.ptr()))) {
@@ -2212,11 +2215,19 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                 if (OB_ITER_END == next_ret) { break; }
                 else if (OB_FAIL(next_ret)) { ret = next_ret; break; }
                 int64_t ac_id = 0, st_id = 0, rq_id = 0, rs_id = 0;
+                char state_col_name[256];
+                int64_t state_col_name_len = 0;
+                ObString tmp_state_col_name;
                 if (OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(0), ac_id))
                     || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(1), st_id))
                     || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(2), rq_id))
-                    || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(3), rs_id))) {
+                    || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(3), rs_id))
+                    || OB_FAIL(ac_res.get_result()->get_varchar(
+                               static_cast<int64_t>(4), tmp_state_col_name))) {
                 } else {
+                  state_col_name_len = snprintf(state_col_name, sizeof(state_col_name),
+                                                "%.*s", tmp_state_col_name.length(),
+                                                tmp_state_col_name.ptr());
                   bool referenced = false;
                   for (int64_t c = 0; !referenced && c < col_exprs.count(); ++c) {
                     ObRawExpr *ce = col_exprs.at(c);
@@ -2250,6 +2261,33 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                         } else if (task_count > 0) {
                           ret = OB_ERR_AI_COLUMN_NOT_READY;
                           LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
+                        }
+                      }
+                    }
+                    ObSqlString state_sql;
+                    if (OB_SUCC(ret)
+                        && OB_FAIL(state_sql.append_fmt(
+                           "SELECT COUNT(*) FROM `%.*s`.`%.*s` "
+                           "WHERE `%.*s` IS NULL OR `%.*s` != 0",
+                           db_name.length(), db_name.ptr(),
+                           table->table_name_.length(), table->table_name_.ptr(),
+                           static_cast<int>(state_col_name_len), state_col_name,
+                           static_cast<int>(state_col_name_len), state_col_name))) {
+                      LOG_WARN("build ai column state sql failed", K(ret));
+                    } else if (OB_SUCC(ret)) {
+                      SMART_VAR(ObMySQLProxy::MySQLResult, state_res) {
+                        if (OB_FAIL(sql_proxy->read(state_res, state_sql.ptr()))) {
+                          LOG_WARN("query ai column state failed", K(ret));
+                        } else if (OB_ISNULL(state_res.get_result())
+                                   || OB_SUCCESS != state_res.get_result()->next()) {
+                        } else {
+                          int64_t not_ready_count = 0;
+                          if (OB_FAIL(state_res.get_result()->get_int(
+                              static_cast<int64_t>(0), not_ready_count))) {
+                          } else if (not_ready_count > 0) {
+                            ret = OB_ERR_AI_COLUMN_NOT_READY;
+                            LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
+                          }
                         }
                       }
                     }

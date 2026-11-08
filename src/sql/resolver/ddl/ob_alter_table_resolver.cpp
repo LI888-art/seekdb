@@ -3682,6 +3682,12 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
                          expr_str.length(), expr_str.ptr());
                 if (OB_FAIL(ob_write_string(*allocator_, ObString(strlen(buf), buf), expr_str))) {
                 }
+              } else if (ob_is_integer_type(alter_column_schema.get_data_type())) {
+                char buf[1024];
+                snprintf(buf, sizeof(buf), "%.*s Return base-10 integer",
+                         expr_str.length(), expr_str.ptr());
+                if (OB_FAIL(ob_write_string(*allocator_, ObString(strlen(buf), buf), expr_str))) {
+                }
               }
               ObString dep_expr;
               if (OB_SUCC(ret) && OB_FAIL(extract_ai_column_dep_expr(

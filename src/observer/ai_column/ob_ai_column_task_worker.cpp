@@ -154,28 +154,33 @@ int ObAIColumnTaskWorker::process_one_task(
     }
   }
 
-  // 1. 查 __all_ai_column 拿 model_name + normalized_expr + max_retries
-  ObString model_name, normalized_expr;
+  // 1. 查 __all_ai_column 拿 model_name + normalized_expr + max_retries + state column
+  ObString model_name, normalized_expr, state_column_name;
   int64_t max_retries = 2;
   {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       snprintf(sql_buf, sizeof(sql_buf),
-               "SELECT ai_model_name, normalized_expr, max_retries "
-               "FROM oceanbase.__all_ai_column WHERE table_id=%ld AND column_id=%ld",
+               "SELECT ac.ai_model_name, ac.normalized_expr, ac.max_retries, sc.column_name "
+               "FROM oceanbase.__all_ai_column ac "
+               "JOIN oceanbase.__all_column sc ON sc.table_id=ac.table_id "
+               "AND sc.column_id=ac.state_column_id "
+               "WHERE ac.table_id=%ld AND ac.column_id=%ld",
                table_id, column_id);
       if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
         OB_LOG(WARN, "query ai_column meta failed", K(ret), K(sql_buf));
       } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
         ret = OB_ENTRY_NOT_EXIST;
       } else {
-        ObString tmp_model, tmp_expr;
+        ObString tmp_model, tmp_expr, tmp_state_column;
         if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_model))
             || OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(1), tmp_expr))
-            || OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(2), max_retries))) {
+            || OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(2), max_retries))
+            || OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(3), tmp_state_column))) {
           OB_LOG(WARN, "read ai_column meta cols failed", K(ret));
         } else {
           ob_write_string(alloc, tmp_model, model_name);
           ob_write_string(alloc, tmp_expr, normalized_expr);
+          ob_write_string(alloc, tmp_state_column, state_column_name);
         }
       }
     }
@@ -291,10 +296,8 @@ int ObAIColumnTaskWorker::process_one_task(
     if (OB_SUCC(ret)) {
       ObAIFuncClient client;
       ObArray<ObString> headers;
-      headers.push_back(ObString::make_string("Content-Type"));
-      headers.push_back(ObString::make_string("application/json"));
-      headers.push_back(ObString::make_string("Authorization"));
-      headers.push_back(ObString::make_string("Bearer p0-key"));
+      headers.push_back(ObString::make_string("Content-Type: application/json"));
+      headers.push_back(ObString::make_string("Authorization: Bearer p0-key"));
       if (OB_FAIL(client.init(alloc, ep_url, headers))) {
         OB_LOG(WARN, "client init failed", K(ret));
       } else {
@@ -432,11 +435,13 @@ int ObAIColumnTaskWorker::process_one_task(
       OB_LOG(WARN, "column_name not found", K(ret), K(table_id), K(column_id));
     } else {
       snprintf(sql_buf, sizeof(sql_buf),
-               "UPDATE %.*s.%.*s SET %.*s='%s' WHERE %.*s",
+               "UPDATE %.*s.%.*s SET %.*s='%s', %.*s=0 WHERE %.*s",
                database_name.length(), database_name.ptr(),
                table_name.length(), table_name.ptr(),
                col_name.length(), col_name.ptr(),
-               sql_escaped, rowkey_predicate.length(), rowkey_predicate.ptr());
+               sql_escaped,
+               state_column_name.length(), state_column_name.ptr(),
+               rowkey_predicate.length(), rowkey_predicate.ptr());
     }
     int64_t affected = 0;
     if (OB_FAIL(sql_proxy_->write(sql_buf, affected))) {
@@ -462,16 +467,53 @@ int ObAIColumnTaskWorker::process_one_task(
     ret = OB_SUCCESS;
   } else {
     int64_t new_retry = retry_count + 1;
-    int64_t new_state = (new_retry > max_retries) ? 3 : 1;
-    snprintf(sql_buf, sizeof(sql_buf),
-             "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=%ld "
-             "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
-             "AND rowkey_predicate='%.*s'",
-             new_retry, new_state, tenant_id, table_id, column_id,
-             rowkey_predicate.length(), rowkey_predicate.ptr());
-    int64_t affected = 0;
-    sql_proxy_->write(sql_buf, affected);
-    OB_LOG(WARN, "task retry scheduled", K(ret), K(new_retry), K(new_state));
+    if (new_retry > max_retries) {
+      // Terminal failure: persist FAILED for strict read, then remove the completed task.
+      snprintf(sql_buf, sizeof(sql_buf),
+               "UPDATE %.*s.%.*s SET %.*s=3 WHERE %.*s",
+               database_name.length(), database_name.ptr(),
+               table_name.length(), table_name.ptr(),
+               state_column_name.length(), state_column_name.ptr(),
+               rowkey_predicate.length(), rowkey_predicate.ptr());
+      int64_t state_affected = 0;
+      int state_ret = sql_proxy_->write(sql_buf, state_affected);
+      if (OB_SUCCESS != state_ret) {
+        OB_LOG(WARN, "persist ai column failed state failed", K(state_ret), K(sql_buf));
+      }
+      if (OB_SUCCESS == state_ret) {
+        snprintf(sql_buf, sizeof(sql_buf),
+                 "DELETE FROM oceanbase.__all_ai_column_task "
+                 "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+                 "AND rowkey_predicate='%.*s' AND request_id=%ld",
+                 tenant_id, table_id, column_id,
+                 rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
+        int64_t task_affected = 0;
+        int task_ret = sql_proxy_->write(sql_buf, task_affected);
+        if (OB_SUCCESS != task_ret) {
+          OB_LOG(WARN, "delete terminal ai task failed", K(task_ret), K(sql_buf));
+        }
+      } else {
+        // Leave the task retryable if FAILED state cannot be persisted.
+        snprintf(sql_buf, sizeof(sql_buf),
+                 "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=1 "
+                 "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+                 "AND rowkey_predicate='%.*s' AND request_id=%ld",
+                 new_retry, tenant_id, table_id, column_id,
+                 rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
+        int64_t affected = 0;
+        sql_proxy_->write(sql_buf, affected);
+      }
+    } else {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=1 "
+               "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+               "AND rowkey_predicate='%.*s' AND request_id=%ld",
+               new_retry, tenant_id, table_id, column_id,
+               rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
+      int64_t affected = 0;
+      sql_proxy_->write(sql_buf, affected);
+    }
+    OB_LOG(WARN, "task retry handled", K(ret), K(new_retry), K(max_retries));
   }
 
   return ret;
