@@ -1026,9 +1026,13 @@ int ObTableModifyOp::execute_ai_task_sql(const char *sql)
   bool save_ignore = get_exec_ctx().get_das_ctx().in_ignore_cascading_;
   get_exec_ctx().get_das_ctx().is_fk_cascading_ = true;
   get_exec_ctx().get_das_ctx().in_ignore_cascading_ = false;
-  if (!session->is_in_transaction()
+  // An explicit user transaction must not be replaced by a new inner
+  // transaction. Autocommit DML may not report the statement transaction yet,
+  // so keep the existing start_transaction() path only for that case.
+  if (!session->has_explicit_start_trans()
+      && !session->is_in_transaction()
       && OB_FAIL(inner_conn_->start_transaction())) {
-    OB_LOG(WARN, "failed to start business transaction for ai task write", K(ret));
+    OB_LOG(WARN, "failed to start ai task transaction", K(ret));
   } else if (OB_FAIL(begin_nested_session(false))) {
   } else {
     if (OB_FAIL(execute_write(sql))) {

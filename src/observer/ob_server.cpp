@@ -2220,7 +2220,8 @@ int ObServer::init_server_runtime()
     if (OB_SUCC(ret)) {
       int64_t reset_rows = 0;
       const char *reset_sql =
-        "UPDATE ai_column_p0_t1.task_shadow SET state=1 WHERE state=2";
+        "UPDATE oceanbase.__all_ai_column_task "
+        "SET state=1, eligible_ts=now(6) WHERE state=2";
       int tmp_ret = sql_proxy_.write(reset_sql, reset_rows);
       if (OB_SUCCESS != tmp_ret) {
         LOG_WARN("reset orphan ai tasks failed", K(tmp_ret));

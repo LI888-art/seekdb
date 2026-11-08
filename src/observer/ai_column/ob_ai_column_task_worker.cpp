@@ -44,6 +44,30 @@ static const char *safe_string_ptr(const ObString &str)
   return NULL == str.ptr() || str.empty() ? "" : str.ptr();
 }
 
+struct ObAIColumnTaskSnapshot
+{
+  ObAIColumnTaskSnapshot()
+    : tenant_id_(0), table_id_(0), column_id_(0), request_id_(0),
+      retry_count_(0), completed_(false), input_ready_(false),
+      published_(false), cleaned_(false), rowkey_predicate_(), user_text_(),
+      result_str_(), column_name_(), state_column_name_()
+  {}
+  int64_t tenant_id_;
+  int64_t table_id_;
+  int64_t column_id_;
+  int64_t request_id_;
+  int64_t retry_count_;
+  bool completed_;
+  bool input_ready_;
+  bool published_;
+  bool cleaned_;
+  ObString rowkey_predicate_;
+  ObString user_text_;
+  ObString result_str_;
+  ObString column_name_;
+  ObString state_column_name_;
+};
+
 static int64_t json_escape_for_http(const char *src, int64_t src_len,
                                     char *dst, int64_t dst_size)
 {
@@ -95,11 +119,202 @@ int ObAIColumnTaskWorker::claim_tasks(int64_t &affected)
   return ret;
 }
 
+static bool same_ai_task_group(const ObAIColumnTaskSnapshot &left,
+                               const ObAIColumnTaskSnapshot &right)
+{
+  return left.tenant_id_ == right.tenant_id_
+      && left.table_id_ == right.table_id_
+      && left.request_id_ == right.request_id_
+      && left.rowkey_predicate_.length() == right.rowkey_predicate_.length()
+      && (0 == left.rowkey_predicate_.length()
+          || 0 == memcmp(left.rowkey_predicate_.ptr(),
+                         right.rowkey_predicate_.ptr(),
+                         left.rowkey_predicate_.length()));
+}
+
+static int append_sql_string_literal(ObSqlString &sql, const ObString &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(sql.append("'"))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+      const char c = value.ptr()[i];
+      if ('\\' == c || '\'' == c) {
+        const char escaped[2] = {c, c};
+        ret = sql.append(escaped, 2);
+      } else {
+        ret = sql.append(&c, 1);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = sql.append("'");
+    }
+  }
+  return ret;
+}
+
+static int publish_group_results(
+    ObMySQLProxy *sql_proxy,
+    ObArray<ObAIColumnTaskSnapshot> &tasks,
+    const int64_t seed,
+    ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObAIColumnTaskSnapshot &first = tasks.at(seed);
+  bool group_completed = true;
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+    if (same_ai_task_group(first, tasks.at(i)) && !tasks.at(i).completed_) {
+      group_completed = false;
+    }
+  }
+  if (!group_completed) {
+    // A failed member keeps the whole request group unpublished.
+  } else {
+    char sql_buf[4096];
+    ObString table_name;
+    ObString database_name;
+    {
+      SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+        snprintf(sql_buf, sizeof(sql_buf),
+                 "SELECT t.table_name, d.database_name FROM oceanbase.__all_table t "
+                 "JOIN oceanbase.__all_database d ON t.database_id=d.database_id "
+                 "WHERE t.table_id=%ld", first.table_id_);
+        if (OB_FAIL(sql_proxy->read(res, sql_buf))) {
+          OB_LOG(WARN, "publish group query table failed", K(ret),
+                 K(first.table_id_));
+        } else if (OB_ISNULL(res.get_result())
+                   || OB_SUCCESS != res.get_result()->next()) {
+          ret = OB_ENTRY_NOT_EXIST;
+        } else {
+          ObString tmp_table;
+          ObString tmp_database;
+          if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_table))
+              || OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(1), tmp_database))) {
+          } else if (OB_FAIL(ob_write_string(allocator, tmp_table, table_name))
+                     || OB_FAIL(ob_write_string(allocator, tmp_database,
+                                                database_name))) {
+          }
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      ObSqlString set_clause;
+      bool first_set = true;
+      for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+        ObAIColumnTaskSnapshot &task = tasks.at(i);
+        if (!same_ai_task_group(first, task)) {
+          continue;
+        }
+        if (!first_set && OB_FAIL(set_clause.append(", "))) {
+        } else if (OB_FAIL(set_clause.append_fmt(
+                       "`%.*s`=", task.column_name_.length(),
+                       task.column_name_.ptr()))) {
+        } else if (OB_FAIL(append_sql_string_literal(
+                       set_clause, task.result_str_))) {
+        } else if (OB_FAIL(set_clause.append_fmt(
+                       ", `%.*s`=0", task.state_column_name_.length(),
+                       task.state_column_name_.ptr()))) {
+        } else {
+          first_set = false;
+        }
+      }
+
+      if (OB_SUCC(ret) && first_set) {
+        ret = OB_ERR_UNEXPECTED;
+        OB_LOG(WARN, "AI task group has no publishable columns", K(ret),
+               K(first.request_id_));
+      }
+
+      ObSqlString publish_sql;
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(publish_sql.append_fmt(
+                     "UPDATE `%.*s`.`%.*s` SET ",
+                     database_name.length(), database_name.ptr(),
+                     table_name.length(), table_name.ptr()))) {
+      } else if (OB_FAIL(publish_sql.append(set_clause.string()))) {
+      } else if (OB_FAIL(publish_sql.append_fmt(
+                     " WHERE %.*s AND EXISTS ("
+                     "SELECT 1 FROM oceanbase.__all_ai_column_task "
+                     "WHERE tenant_id=%ld AND table_id=%ld "
+                     "AND rowkey_predicate=",
+                     first.rowkey_predicate_.length(),
+                     first.rowkey_predicate_.ptr(),
+                     first.tenant_id_, first.table_id_))) {
+      } else if (OB_FAIL(append_sql_string_literal(
+                     publish_sql, first.rowkey_predicate_))) {
+      } else if (OB_FAIL(publish_sql.append_fmt(
+                     " AND request_id=%ld)", first.request_id_))) {
+      } else {
+        int64_t affected = 0;
+        if (OB_FAIL(sql_proxy->write(publish_sql.ptr(), affected))) {
+          OB_LOG(WARN, "publish AI task group failed", K(ret),
+                 K(publish_sql));
+        } else if (0 == affected) {
+          OB_LOG(INFO, "AI task group publish discarded as stale",
+                 K(first.table_id_), K(first.request_id_));
+        } else {
+          OB_LOG(INFO, "AI task group published", K(first.table_id_),
+                 K(first.request_id_), K(affected));
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+          if (same_ai_task_group(first, tasks.at(i))) {
+            tasks.at(i).published_ = true;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+static int cleanup_published_group(
+    ObMySQLProxy *sql_proxy,
+    ObArray<ObAIColumnTaskSnapshot> &tasks,
+    const int64_t seed)
+{
+  int ret = OB_SUCCESS;
+  ObAIColumnTaskSnapshot &first = tasks.at(seed);
+  if (!first.published_ || first.cleaned_) {
+  } else {
+    char cleanup_buf[4096];
+    ObSqlString rowkey_literal;
+    if (OB_FAIL(append_sql_string_literal(
+            rowkey_literal, first.rowkey_predicate_))) {
+    } else {
+      snprintf(cleanup_buf, sizeof(cleanup_buf),
+               "DELETE FROM oceanbase.__all_ai_column_task "
+               "WHERE tenant_id=%ld AND table_id=%ld "
+               "AND rowkey_predicate=%s AND request_id=%ld",
+               first.tenant_id_, first.table_id_, rowkey_literal.ptr(),
+               first.request_id_);
+      int64_t affected = 0;
+      if (OB_FAIL(sql_proxy->write(cleanup_buf, affected))) {
+        OB_LOG(WARN, "cleanup published AI task group failed", K(ret),
+               K(cleanup_buf));
+      } else {
+        OB_LOG(INFO, "cleanup published AI task group",
+               K(first.table_id_), K(first.request_id_), K(affected));
+        for (int64_t i = 0; i < tasks.count(); ++i) {
+          if (same_ai_task_group(first, tasks.at(i))) {
+            tasks.at(i).cleaned_ = true;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObAIColumnTaskWorker::process_tasks()
 {
   int ret = OB_SUCCESS;
-  int64_t task_count = 0;
+  ObArenaAllocator task_alloc("ai_task_snap");
+  ObArray<ObAIColumnTaskSnapshot> tasks;
   OB_LOG(INFO, "process ai tasks begin");
+
+  // Phase 1: snapshot all claimed tasks before executing model calls or writes.
   SMART_VAR(ObMySQLProxy::MySQLResult, res) {
     const char *select_sql =
       "SELECT tenant_id, table_id, column_id, rowkey_predicate, request_id, retry_count "
@@ -117,10 +332,9 @@ int ObAIColumnTaskWorker::process_tasks()
           break;
         } else if (OB_SUCCESS != next_ret) {
           ret = next_ret;
-          OB_LOG(WARN, "iterate ai task result failed", K(ret), K(task_count));
+          OB_LOG(WARN, "iterate ai task result failed", K(ret), K(tasks.count()));
           break;
         }
-        ++task_count;
         int64_t tenant_id = 0, table_id = 0, column_id = 0;
         int64_t request_id = 0, retry_count = 0;
         ObString rowkey_predicate;
@@ -132,10 +346,7 @@ int ObAIColumnTaskWorker::process_tasks()
             || OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(5), retry_count))) {
           OB_LOG(WARN, "read task cols failed", K(ret));
         } else {
-          ObArenaAllocator task_alloc("ai_task_rowkey");
           ObString rowkey_copy;
-          OB_LOG(INFO, "process one ai task", K(task_count), K(tenant_id),
-                 K(table_id), K(column_id), K(request_id), K(retry_count));
           if (rowkey_predicate.empty() || OB_ISNULL(rowkey_predicate.ptr())) {
             ret = OB_INVALID_ARGUMENT;
             OB_LOG(ERROR, "invalid ai task rowkey", K(ret), K(tenant_id),
@@ -143,47 +354,214 @@ int ObAIColumnTaskWorker::process_tasks()
           } else if (OB_FAIL(ob_write_string(task_alloc, rowkey_predicate, rowkey_copy))) {
             OB_LOG(WARN, "copy ai task rowkey failed", K(ret));
           } else {
-            fprintf(stderr,
-                    "[FIX] process task table=%ld col=%ld request=%ld rowkey_len=%d\n",
-                    table_id, column_id, request_id, rowkey_copy.length());
-            fflush(stderr);
-            int tmp_ret = process_one_task(tenant_id, table_id, column_id,
-                                           rowkey_copy, request_id, retry_count);
-            if (OB_SUCCESS != tmp_ret) {
-              OB_LOG(WARN, "process one task failed", K(tmp_ret),
-                     K(tenant_id), K(table_id), K(column_id));
-            } else {
-              OB_LOG(INFO, "process one task finished", K(tenant_id),
-                     K(table_id), K(column_id), K(request_id));
+            ObAIColumnTaskSnapshot task;
+            task.tenant_id_ = tenant_id;
+            task.table_id_ = table_id;
+            task.column_id_ = column_id;
+            task.request_id_ = request_id;
+            task.retry_count_ = retry_count;
+            task.rowkey_predicate_ = rowkey_copy;
+            if (OB_FAIL(tasks.push_back(task))) {
+              OB_LOG(WARN, "append ai task snapshot failed", K(ret), K(tasks.count()));
             }
-          }
-          if (OB_FAIL(ret)) {
-            char cleanup_buf[1024];
-            snprintf(cleanup_buf, sizeof(cleanup_buf),
-                     "DELETE FROM oceanbase.__all_ai_column_task "
-                     "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
-                     "AND request_id=%ld",
-                     tenant_id, table_id, column_id, request_id);
-            int64_t cleanup_affected = 0;
-            int cleanup_ret = sql_proxy_->write(cleanup_buf, cleanup_affected);
-            if (OB_SUCCESS != cleanup_ret) {
-              OB_LOG(WARN, "cleanup malformed ai task failed", K(cleanup_ret),
-                     K(table_id), K(column_id), K(request_id));
-            }
-            break;
           }
         }
       }
     }
   }
-  OB_LOG(INFO, "process ai tasks finished", K(ret), K(task_count));
+
+  // Phase 2: freeze every model input before the first model call.
+  for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+    ObAIColumnTaskSnapshot &task = tasks.at(i);
+    const int prep_ret = prepare_task_input(
+        task.table_id_, task.column_id_, task.rowkey_predicate_,
+        task_alloc, task.user_text_);
+    if (OB_SUCCESS != prep_ret) {
+      OB_LOG(WARN, "prepare ai task input failed", K(prep_ret),
+             K(task.table_id_), K(task.column_id_), K(task.request_id_));
+    } else {
+      task.input_ready_ = true;
+    }
+  }
+
+  // Phase 3: execute all model calls and collect results without publishing.
+  for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+    ObAIColumnTaskSnapshot &task = tasks.at(i);
+    fprintf(stderr,
+            "[FIX] process task idx=%ld/%ld table=%ld col=%ld request=%ld input_ready=%d\n",
+            i, tasks.count(), task.table_id_, task.column_id_,
+            task.request_id_, task.input_ready_);
+    fflush(stderr);
+    const int tmp_ret = execute_one_task(
+        task.tenant_id_, task.table_id_, task.column_id_,
+        task.rowkey_predicate_, task.request_id_, task.retry_count_,
+        task.user_text_, task.input_ready_, task_alloc,
+        task.result_str_, task.column_name_, task.state_column_name_);
+    task.completed_ = (OB_SUCCESS == tmp_ret);
+    if (OB_SUCCESS != tmp_ret) {
+      OB_LOG(WARN, "execute one task failed", K(tmp_ret),
+             K(task.table_id_), K(task.column_id_), K(task.request_id_));
+    } else {
+      OB_LOG(INFO, "execute one task finished", K(task.table_id_),
+             K(task.column_id_), K(task.request_id_));
+    }
+  }
+
+  // Phase 4: publish each request group with one atomic UPDATE.
+  for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+    ObAIColumnTaskSnapshot &task = tasks.at(i);
+    if (!task.completed_ || task.published_) {
+      continue;
+    }
+    if (OB_FAIL(publish_group_results(sql_proxy_, tasks, i, task_alloc))) {
+      OB_LOG(WARN, "publish AI task group failed", K(ret),
+             K(task.table_id_), K(task.request_id_));
+    }
+  }
+
+  // Phase 5: remove all task rows belonging to a published request group.
+  for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+    ObAIColumnTaskSnapshot &task = tasks.at(i);
+    if (!task.published_ || task.cleaned_) {
+      continue;
+    }
+    if (OB_FAIL(cleanup_published_group(sql_proxy_, tasks, i))) {
+      OB_LOG(WARN, "cleanup AI task group failed", K(ret),
+             K(task.table_id_), K(task.request_id_));
+    }
+  }
+
+  OB_LOG(INFO, "process ai tasks finished", K(ret), K(tasks.count()));
   return ret;
 }
 
 static FILE *debug_fp = fopen("/tmp/retry_fix.log", "a");
-int ObAIColumnTaskWorker::process_one_task(
+
+int ObAIColumnTaskWorker::prepare_task_input(
+    int64_t table_id, int64_t column_id,
+    const ObString &rowkey_predicate, ObIAllocator &allocator,
+    ObString &user_text)
+{
+  int ret = OB_SUCCESS;
+  char sql_buf[16384];
+  ObString table_name;
+  ObString database_name;
+  ObString normalized_expr;
+  ObString content;
+
+  {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "SELECT t.table_name, d.database_name FROM oceanbase.__all_table t "
+               "JOIN oceanbase.__all_database d ON t.database_id = d.database_id "
+               "WHERE t.table_id=%ld", table_id);
+      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+        OB_LOG(WARN, "prepare task query table failed", K(ret), K(table_id));
+      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+        ret = OB_ENTRY_NOT_EXIST;
+      } else {
+        ObString tmp_table;
+        ObString tmp_database;
+        if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_table))
+            || OB_FAIL(res.get_result()->get_varchar(1, tmp_database))
+            || OB_FAIL(ob_write_string(allocator, tmp_table, table_name))
+            || OB_FAIL(ob_write_string(allocator, tmp_database, database_name))) {
+          OB_LOG(WARN, "prepare task copy table failed", K(ret), K(table_id));
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "SELECT normalized_expr FROM oceanbase.__all_ai_column "
+               "WHERE table_id=%ld AND column_id=%ld", table_id, column_id);
+      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+        OB_LOG(WARN, "prepare task query metadata failed", K(ret),
+               K(table_id), K(column_id));
+      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+        ret = OB_ENTRY_NOT_EXIST;
+      } else {
+        ObString tmp_expr;
+        if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_expr))
+            || OB_FAIL(ob_write_string(allocator, tmp_expr, normalized_expr))) {
+          OB_LOG(WARN, "prepare task copy metadata failed", K(ret),
+                 K(table_id), K(column_id));
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      snprintf(sql_buf, sizeof(sql_buf),
+               "SELECT content FROM %.*s.%.*s WHERE %.*s",
+               database_name.length(), database_name.ptr(),
+               table_name.length(), table_name.ptr(),
+               rowkey_predicate.length(), rowkey_predicate.ptr());
+      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+        OB_LOG(WARN, "prepare task query content failed", K(ret), K(sql_buf));
+      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+        ret = OB_ENTRY_NOT_EXIST;
+      } else {
+        ObString tmp_content;
+        if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_content))
+            || OB_FAIL(ob_write_string(allocator, tmp_content, content))) {
+          OB_LOG(WARN, "prepare task copy content failed", K(ret),
+                 K(table_id), K(column_id));
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && OB_FAIL(ob_write_string(allocator, content, user_text))) {
+    OB_LOG(WARN, "prepare task copy user text failed", K(ret),
+           K(table_id), K(column_id));
+  }
+  if (OB_SUCC(ret)) {
+    const char *sep = safe_memmem(normalized_expr.ptr(), normalized_expr.length(), "|||", 3);
+    if (NULL != sep) {
+      const int64_t prompt_len = sep - normalized_expr.ptr();
+      ObString dep_expr;
+      dep_expr.assign_ptr(sep + 3,
+                          static_cast<int32_t>(normalized_expr.length() - prompt_len - 3));
+      if (!dep_expr.empty()) {
+        SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+          snprintf(sql_buf, sizeof(sql_buf),
+                   "SELECT %.*s FROM %.*s.%.*s WHERE %.*s",
+                   dep_expr.length(), dep_expr.ptr(),
+                   database_name.length(), database_name.ptr(),
+                   table_name.length(), table_name.ptr(),
+                   rowkey_predicate.length(), rowkey_predicate.ptr());
+          if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
+            OB_LOG(WARN, "prepare task evaluate dependency failed",
+                   K(ret), K(sql_buf));
+          } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
+            ret = OB_ENTRY_NOT_EXIST;
+          } else {
+            ObString tmp_user_text;
+            if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(0), tmp_user_text))
+                || OB_FAIL(ob_write_string(allocator, tmp_user_text, user_text))) {
+              OB_LOG(WARN, "prepare task copy evaluated input failed", K(ret),
+                     K(table_id), K(column_id));
+            }
+          }
+        }
+      }
+    }
+  }
+  OB_LOG(INFO, "prepare ai task input finished", K(ret), K(table_id),
+         K(column_id), K(user_text));
+  return ret;
+}
+
+int ObAIColumnTaskWorker::execute_one_task(
     int64_t tenant_id, int64_t table_id, int64_t column_id,
-    const ObString &rowkey_predicate, int64_t request_id, int64_t retry_count)
+    const ObString &rowkey_predicate, int64_t request_id, int64_t retry_count,
+    const ObString &prepared_user_text, bool use_prepared_input,
+    ObIAllocator &result_allocator, ObString &result_str,
+    ObString &column_name, ObString &out_state_column_name)
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator alloc("ai_worker");
@@ -250,7 +628,7 @@ int ObAIColumnTaskWorker::process_one_task(
 
   // 2. 查 docs 拿依赖列 content
   ObString content;
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && !use_prepared_input) {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       snprintf(sql_buf, sizeof(sql_buf),
                "SELECT content FROM %.*s.%.*s WHERE %.*s",
@@ -282,9 +660,9 @@ int ObAIColumnTaskWorker::process_one_task(
       prompt.assign_ptr(normalized_expr.ptr(), static_cast<int32_t>(prompt_len));
       dep_expr.assign_ptr(sep + 3, static_cast<int32_t>(normalized_expr.length() - prompt_len - 3));
     }
-    user_text = content;
+    user_text = use_prepared_input ? prepared_user_text : content;
   }
-  if (OB_SUCC(ret) && !dep_expr.empty()) {
+  if (OB_SUCC(ret) && !use_prepared_input && !dep_expr.empty()) {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       snprintf(sql_buf, sizeof(sql_buf),
                "SELECT %.*s FROM %.*s.%.*s WHERE %.*s",
@@ -348,9 +726,9 @@ int ObAIColumnTaskWorker::process_one_task(
         char body_buf[16384];
         int64_t body_len = 0;
         if (is_embedding_ep) {
-          // embeddings: {"model":"...","input":"<content>"}
+          // embeddings: use the same frozen input as chat/completions.
           char content_esc[8192];
-          int64_t content_esc_len = json_escape_for_http(content.ptr(), content.length(),
+          int64_t content_esc_len = json_escape_for_http(user_text.ptr(), user_text.length(),
                                                          content_esc, sizeof(content_esc));
           body_len = snprintf(body_buf, sizeof(body_buf),
               "{\"model\":\"%.*s\",\"input\":\"%.*s\"}",
@@ -443,78 +821,47 @@ int ObAIColumnTaskWorker::process_one_task(
     fflush(stderr);
   }
 
-  // 6. 写回真实结果（SQL 转义：\ 和 ' 都双写）
-  if (OB_SUCC(ret) && !ai_result.empty()) {
-    char sql_escaped[16384];
-    int64_t esc_pos = 0;
-    for (int64_t i = 0; i < ai_result.length() && esc_pos < (int64_t)sizeof(sql_escaped) - 2; ++i) {
-      char c = ai_result.ptr()[i];
-      if ('\\' == c) {
-        sql_escaped[esc_pos++] = '\\';
-        sql_escaped[esc_pos++] = '\\';
-      } else if ('\'' == c) {
-        sql_escaped[esc_pos++] = '\'';
-        sql_escaped[esc_pos++] = '\'';
-      } else {
-        sql_escaped[esc_pos++] = c;
-      }
-    }
-    sql_escaped[esc_pos] = 0;
-    // 按 column_id 查列名
+  // 6. Collect the result for grouped atomic publication.
+  if (OB_SUCC(ret)) {
     ObString col_name;
-    {
+    if (ai_result.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+      OB_LOG(WARN, "AI model returned empty result", K(ret),
+             K(table_id), K(column_id));
+    } else {
       SMART_VAR(ObMySQLProxy::MySQLResult, res2) {
         snprintf(sql_buf, sizeof(sql_buf),
                  "SELECT column_name FROM oceanbase.__all_column "
                  "WHERE table_id=%ld AND column_id=%ld", table_id, column_id);
-        if (OB_SUCC(sql_proxy_->read(res2, sql_buf))
-            && OB_NOT_NULL(res2.get_result())
-            && OB_SUCCESS == res2.get_result()->next()) {
+        if (OB_FAIL(sql_proxy_->read(res2, sql_buf))) {
+          OB_LOG(WARN, "query AI result column name failed", K(ret),
+                 K(table_id), K(column_id));
+        } else if (OB_ISNULL(res2.get_result())
+                   || OB_SUCCESS != res2.get_result()->next()) {
+          ret = OB_ENTRY_NOT_EXIST;
+        } else {
           ObString tmp_col;
-          res2.get_result()->get_varchar(static_cast<int64_t>(0), tmp_col);
-          ob_write_string(alloc, tmp_col, col_name);
+          if (OB_FAIL(res2.get_result()->get_varchar(static_cast<int64_t>(0), tmp_col))
+              || OB_FAIL(ob_write_string(alloc, tmp_col, col_name))) {
+            OB_LOG(WARN, "copy AI result column name failed", K(ret),
+                   K(table_id), K(column_id));
+          }
         }
       }
     }
-    if (col_name.empty()) {
-      ret = OB_ENTRY_NOT_EXIST;
-      OB_LOG(WARN, "column_name not found", K(ret), K(table_id), K(column_id));
-    } else {
-      snprintf(sql_buf, sizeof(sql_buf),
-               "UPDATE %.*s.%.*s SET %.*s='%s', %.*s=0 WHERE %.*s AND EXISTS ("
-               "SELECT 1 FROM oceanbase.__all_ai_column_task "
-               "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
-               "AND rowkey_predicate='%.*s' AND request_id=%ld)",
-               database_name.length(), database_name.ptr(),
-               table_name.length(), table_name.ptr(),
-               col_name.length(), col_name.ptr(),
-               sql_escaped,
-               state_column_name.length(), state_column_name.ptr(),
-               rowkey_predicate.length(), rowkey_predicate.ptr(),
-               tenant_id, table_id, column_id,
-               rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
-    }
-    int64_t affected = 0;
-    if (OB_FAIL(sql_proxy_->write(sql_buf, affected))) {
-      OB_LOG(WARN, "writeback failed", K(ret), K(sql_buf));
-    } else if (0 == affected) {
-      // The row is gone or request_id is stale. Keep the current task untouched.
-      OB_LOG(INFO, "conditional writeback discarded stale result",
-             K(table_id), K(column_id), K(request_id));
-      ret = OB_ENTRY_NOT_EXIST;
+    if (OB_SUCC(ret)
+        && (OB_FAIL(ob_write_string(result_allocator, ai_result, result_str))
+            || OB_FAIL(ob_write_string(result_allocator, col_name, column_name))
+            || OB_FAIL(ob_write_string(result_allocator, state_column_name,
+                                       out_state_column_name)))) {
+      OB_LOG(WARN, "copy AI task result for publication failed", K(ret),
+             K(table_id), K(column_id));
     }
   }
 
-  // 7. 成功删任务 / 失败重试
+  // 7. 成功结果等待组发布 / 失败重试
   if (OB_SUCC(ret)) {
-    snprintf(sql_buf, sizeof(sql_buf),
-             "DELETE FROM oceanbase.__all_ai_column_task "
-             "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
-             "AND rowkey_predicate='%.*s' AND request_id=%ld",
-             tenant_id, table_id, column_id,
-             rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
-    int64_t affected = 0;
-    sql_proxy_->write(sql_buf, affected);
+    // Successful results stay state=2 until process_tasks() publishes the group.
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
   } else {

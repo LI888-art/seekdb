@@ -2361,7 +2361,7 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
                     }
                     if (OB_SUCC(ret) && !first_col) {
                       if (OB_FAIL(null_sql.append_fmt(" WHERE %.*s",
-                                 old_pk.length(), old_pk.ptr()))) {
+                                 new_pk.length(), new_pk.ptr()))) {
                       } else if (OB_FAIL(op.execute_ai_task_sql(null_sql.ptr()))) {
                         SQL_ENG_LOG(WARN, "nullify ai columns failed", K(ret), K(null_sql));
                       }
@@ -2528,7 +2528,7 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
                   }
                 }
                 if (OB_SUCC(ret) && !first_col) {
-                  if (OB_FAIL(null_sql.append_fmt(" WHERE %.*s", old_pk.length(), old_pk.ptr()))) {
+                  if (OB_FAIL(null_sql.append_fmt(" WHERE %.*s", new_pk.length(), new_pk.ptr()))) {
                   } else if (OB_FAIL(op.execute_ai_task_sql(null_sql.ptr()))) {
                     SQL_ENG_LOG(WARN, "nullify ai columns single row failed", K(ret), K(null_sql));
                   }

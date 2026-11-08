@@ -8,6 +8,7 @@
 namespace oceanbase {
 namespace common {
 class ObMySQLProxy;
+class ObIAllocator;
 }
 namespace observer {
 
@@ -21,9 +22,19 @@ public:
 private:
   int claim_tasks(int64_t &affected);
   int process_tasks();
-  int process_one_task(int64_t tenant_id, int64_t table_id, int64_t column_id,
+  int prepare_task_input(int64_t table_id, int64_t column_id,
+                         const common::ObString &rowkey_predicate,
+                         common::ObIAllocator &allocator,
+                         common::ObString &user_text);
+  int execute_one_task(int64_t tenant_id, int64_t table_id, int64_t column_id,
                        const common::ObString &rowkey_predicate,
-                       int64_t request_id, int64_t retry_count);
+                       int64_t request_id, int64_t retry_count,
+                       const common::ObString &prepared_user_text,
+                       bool use_prepared_input,
+                       common::ObIAllocator &result_allocator,
+                       common::ObString &result_str,
+                       common::ObString &column_name,
+                       common::ObString &out_state_column_name);
   bool inited_;
   common::ObMySQLProxy *sql_proxy_;
 };
