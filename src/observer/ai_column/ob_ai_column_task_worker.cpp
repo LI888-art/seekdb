@@ -88,7 +88,7 @@ int ObAIColumnTaskWorker::claim_tasks(int64_t &affected)
   affected = 0;
   const char *claim_sql =
     "UPDATE oceanbase.__all_ai_column_task SET state=2 "
-    "WHERE state=1 AND eligible_ts <= now(6) LIMIT 10";
+    "WHERE state IN (1, 3) AND eligible_ts <= now(6) LIMIT 10";
   if (OB_FAIL(sql_proxy_->write(claim_sql, affected))) {
     OB_LOG(WARN, "claim ai tasks failed", K(ret));
   }
@@ -621,7 +621,7 @@ int ObAIColumnTaskWorker::process_one_task(
       const int rowkey_len = safe_string_length(rowkey_predicate);
       const char *rowkey_ptr = safe_string_ptr(rowkey_predicate);
       snprintf(sql_buf, sizeof(sql_buf),
-               "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=1 "
+               "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=3, eligible_ts=now(6) + INTERVAL 1 SECOND "
                "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
                "AND rowkey_predicate='%.*s' AND request_id=%ld",
                new_retry, tenant_id, table_id, column_id,

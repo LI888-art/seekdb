@@ -2203,15 +2203,18 @@ int ObServer::init_server_runtime()
     }
   }
 
-  // 注册 AI 列任务 worker（2s 间隔）
+  // 注册 AI 列任务 worker（50ms 间隔）
   if (OB_SUCC(ret)) {
+    // 业务事务提交后需尽快领取任务。后续 DML 会按同一 rowkey
+    // 覆盖旧任务；领取过慢会让旧版本请求尚未发出就丢失。
+    const int64_t worker_interval_us = 50L * 1000L;
     if (OB_FAIL(ai_column_task_worker_.init(&sql_proxy_))) {
     } else if (OB_FAIL(ai_column_timer_.schedule_repeate_task_immediately(
-                           ai_column_task_worker_, 2000000))) {
+                           ai_column_task_worker_, worker_interval_us))) {
     } else {
       const bool task_exists = ai_column_timer_.task_exist(ai_column_task_worker_);
       LOG_INFO("ai column task worker scheduled",
-               K(ai_column_timer_), K(task_exists));
+               K(ai_column_timer_), K(task_exists), K(worker_interval_us));
     }
     // 中断恢复: 把上次崩溃遗留的 PROCESSING(state=2) 任务重置为 PENDING(state=1)
     if (OB_SUCC(ret)) {
