@@ -1015,7 +1015,10 @@ int ObTableModifyOp::check_ai_column(const ObDMLBaseCtDef &ctdef, bool &has_ai_c
 int ObTableModifyOp::execute_ai_task_sql(const char *sql)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(inner_conn_) && OB_FAIL(open_inner_conn())) {
+  ObSQLSessionInfo *session = get_exec_ctx().get_my_session();
+  if (OB_ISNULL(session)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(inner_conn_) && OB_FAIL(open_inner_conn())) {
   } else if (OB_ISNULL(inner_conn_)) {
     ret = OB_NOT_INIT;
   } else {
@@ -1023,7 +1026,10 @@ int ObTableModifyOp::execute_ai_task_sql(const char *sql)
   bool save_ignore = get_exec_ctx().get_das_ctx().in_ignore_cascading_;
   get_exec_ctx().get_das_ctx().is_fk_cascading_ = true;
   get_exec_ctx().get_das_ctx().in_ignore_cascading_ = false;
-  if (OB_FAIL(begin_nested_session(false))) {
+  if (!session->is_in_transaction()
+      && OB_FAIL(inner_conn_->start_transaction())) {
+    OB_LOG(WARN, "failed to start business transaction for ai task write", K(ret));
+  } else if (OB_FAIL(begin_nested_session(false))) {
   } else {
     if (OB_FAIL(execute_write(sql))) {
     }

@@ -243,32 +243,7 @@ int ObAIColumnTaskWorker::process_one_task(
     }
   }
 
-  // 4. 迟到保护：写回前再查 request_id
-  if (OB_SUCC(ret)) {
-    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
-      snprintf(sql_buf, sizeof(sql_buf),
-               "SELECT request_id FROM oceanbase.__all_ai_column_task "
-               "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
-               "AND rowkey_predicate='%.*s'",
-               tenant_id, table_id, column_id,
-               rowkey_predicate.length(), rowkey_predicate.ptr());
-      int64_t cur_req = -1;
-      if (OB_FAIL(sql_proxy_->read(res, sql_buf))) {
-        OB_LOG(WARN, "query cur request_id failed", K(ret));
-      } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
-        ret = OB_ENTRY_NOT_EXIST;
-        OB_LOG(INFO, "task gone, skip", K(ret));
-      } else {
-        res.get_result()->get_int(static_cast<int64_t>(0), cur_req);
-        if (cur_req != request_id) {
-          OB_LOG(INFO, "late result discarded", K(cur_req), K(request_id));
-          ret = OB_ENTRY_NOT_EXIST;
-        }
-      }
-    }
-  }
-
-  // 5. 调真实模型（Mock HTTP）
+  // 4. 调真实模型（Mock HTTP）。The result is guarded atomically at writeback.
   ObString ai_result;
   if (OB_SUCC(ret)) {
     ObString ep_url, ep_req_model;
@@ -435,20 +410,26 @@ int ObAIColumnTaskWorker::process_one_task(
       OB_LOG(WARN, "column_name not found", K(ret), K(table_id), K(column_id));
     } else {
       snprintf(sql_buf, sizeof(sql_buf),
-               "UPDATE %.*s.%.*s SET %.*s='%s', %.*s=0 WHERE %.*s",
+               "UPDATE %.*s.%.*s SET %.*s='%s', %.*s=0 WHERE %.*s AND EXISTS ("
+               "SELECT 1 FROM oceanbase.__all_ai_column_task "
+               "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+               "AND rowkey_predicate='%.*s' AND request_id=%ld)",
                database_name.length(), database_name.ptr(),
                table_name.length(), table_name.ptr(),
                col_name.length(), col_name.ptr(),
                sql_escaped,
                state_column_name.length(), state_column_name.ptr(),
-               rowkey_predicate.length(), rowkey_predicate.ptr());
+               rowkey_predicate.length(), rowkey_predicate.ptr(),
+               tenant_id, table_id, column_id,
+               rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
     }
     int64_t affected = 0;
     if (OB_FAIL(sql_proxy_->write(sql_buf, affected))) {
       OB_LOG(WARN, "writeback failed", K(ret), K(sql_buf));
     } else if (0 == affected) {
-      // 行已被 DELETE，放弃本次结果，清理任务
-      OB_LOG(INFO, "row gone, discard result", K(table_id), K(column_id));
+      // The row is gone or request_id is stale. Keep the current task untouched.
+      OB_LOG(INFO, "conditional writeback discarded stale result",
+             K(table_id), K(column_id), K(request_id));
       ret = OB_ENTRY_NOT_EXIST;
     }
   }
@@ -467,6 +448,7 @@ int ObAIColumnTaskWorker::process_one_task(
     ret = OB_SUCCESS;
   } else {
     int64_t new_retry = retry_count + 1;
+    OB_LOG(WARN, "worker non-success branch", K(ret), K(new_retry), K(max_retries));
     if (new_retry > max_retries) {
       // Terminal failure: persist FAILED for strict read, then remove the completed task.
       snprintf(sql_buf, sizeof(sql_buf),
@@ -480,6 +462,36 @@ int ObAIColumnTaskWorker::process_one_task(
       if (OB_SUCCESS != state_ret) {
         OB_LOG(WARN, "persist ai column failed state failed", K(state_ret), K(sql_buf));
       }
+      if (OB_SUCCESS == state_ret && 0 == state_affected) {
+        // affected_rows may be zero when the state is already FAILED. Verify the
+        // persisted value instead of issuing an unsafe REPLACE of the user row.
+        char state_check_buf[4096];
+        snprintf(state_check_buf, sizeof(state_check_buf),
+                 "SELECT %.*s FROM %.*s.%.*s WHERE %.*s",
+                 state_column_name.length(), state_column_name.ptr(),
+                 database_name.length(), database_name.ptr(),
+                 table_name.length(), table_name.ptr(),
+                 rowkey_predicate.length(), rowkey_predicate.ptr());
+        SMART_VAR(ObMySQLProxy::MySQLResult, state_res) {
+          int64_t persisted_state = -1;
+          int check_ret = sql_proxy_->read(state_res, state_check_buf);
+          if (OB_SUCCESS != check_ret) {
+            state_ret = check_ret;
+          } else if (OB_ISNULL(state_res.get_result())
+                     || OB_SUCCESS != state_res.get_result()->next()) {
+            state_ret = OB_ENTRY_NOT_EXIST;
+          } else if (OB_SUCCESS != (state_ret =
+                     state_res.get_result()->get_int(static_cast<int64_t>(0), persisted_state))) {
+          } else if (3 != persisted_state) {
+            state_ret = OB_ERR_UNEXPECTED;
+          } else {
+            state_affected = 1;
+            state_ret = OB_SUCCESS;
+          }
+        }
+      }
+      OB_LOG(WARN, "worker terminal fail debug",
+             K(ret), K(state_ret), K(state_affected), K(sql_buf), K(rowkey_predicate));
       if (OB_SUCCESS == state_ret) {
         snprintf(sql_buf, sizeof(sql_buf),
                  "DELETE FROM oceanbase.__all_ai_column_task "

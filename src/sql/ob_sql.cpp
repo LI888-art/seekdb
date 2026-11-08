@@ -2239,6 +2239,8 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                     }
                   }
                   if (!referenced) { continue; }
+                  int64_t task_count = 0;
+                  int64_t not_ready_count = 0;
                   ObSqlString task_sql;
                   if (OB_FAIL(task_sql.append_fmt(
                         "SELECT COUNT(*) FROM oceanbase.__all_ai_column_task "
@@ -2256,11 +2258,7 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                         LOG_WARN("query task count failed", K(ret));
                       } else if (OB_ISNULL(task_res.get_result()) || OB_SUCCESS != task_res.get_result()->next()) {
                       } else {
-                        int64_t task_count = 0;
                         if (OB_FAIL(task_res.get_result()->get_int(static_cast<int64_t>(0), task_count))) {
-                        } else if (task_count > 0) {
-                          ret = OB_ERR_AI_COLUMN_NOT_READY;
-                          LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
                         }
                       }
                     }
@@ -2281,15 +2279,19 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                         } else if (OB_ISNULL(state_res.get_result())
                                    || OB_SUCCESS != state_res.get_result()->next()) {
                         } else {
-                          int64_t not_ready_count = 0;
                           if (OB_FAIL(state_res.get_result()->get_int(
                               static_cast<int64_t>(0), not_ready_count))) {
-                          } else if (not_ready_count > 0) {
-                            ret = OB_ERR_AI_COLUMN_NOT_READY;
-                            LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
                           }
                         }
                       }
+                    }
+                    ObString state_col_str(static_cast<int32_t>(state_col_name_len),
+                                           state_col_name);
+                    OB_LOG(WARN, "state check debug", K(ac_id), K(state_col_str),
+                           K(not_ready_count), K(task_count));
+                    if (OB_SUCC(ret) && (task_count > 0 || not_ready_count > 0)) {
+                      ret = OB_ERR_AI_COLUMN_NOT_READY;
+                      LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
                     }
                   }
                   if (OB_FAIL(ret)) break;
