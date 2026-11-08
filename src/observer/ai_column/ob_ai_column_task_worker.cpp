@@ -34,6 +34,16 @@ static const char *safe_strchr(const char *haystack, int64_t haystack_len, char 
   return nullptr;
 }
 
+static int safe_string_length(const ObString &str)
+{
+  return NULL == str.ptr() || str.empty() ? 0 : static_cast<int>(str.length());
+}
+
+static const char *safe_string_ptr(const ObString &str)
+{
+  return NULL == str.ptr() || str.empty() ? "" : str.ptr();
+}
+
 static int64_t json_escape_for_http(const char *src, int64_t src_len,
                                     char *dst, int64_t dst_size)
 {
@@ -88,6 +98,8 @@ int ObAIColumnTaskWorker::claim_tasks(int64_t &affected)
 int ObAIColumnTaskWorker::process_tasks()
 {
   int ret = OB_SUCCESS;
+  int64_t task_count = 0;
+  OB_LOG(INFO, "process ai tasks begin");
   SMART_VAR(ObMySQLProxy::MySQLResult, res) {
     const char *select_sql =
       "SELECT tenant_id, table_id, column_id, rowkey_predicate, request_id, retry_count "
@@ -95,8 +107,20 @@ int ObAIColumnTaskWorker::process_tasks()
     if (OB_FAIL(sql_proxy_->read(res, select_sql))) {
       OB_LOG(WARN, "select ai tasks failed", K(ret));
     } else if (OB_ISNULL(res.get_result())) {
+      ret = OB_ERR_NULL_VALUE;
+      OB_LOG(WARN, "ai task result is null", K(ret));
     } else {
-      while (OB_SUCC(res.get_result()->next())) {
+      while (OB_SUCC(ret)) {
+        int next_ret = res.get_result()->next();
+        if (OB_ITER_END == next_ret) {
+          // EOF is the normal terminal condition for a result-set scan.
+          break;
+        } else if (OB_SUCCESS != next_ret) {
+          ret = next_ret;
+          OB_LOG(WARN, "iterate ai task result failed", K(ret), K(task_count));
+          break;
+        }
+        ++task_count;
         int64_t tenant_id = 0, table_id = 0, column_id = 0;
         int64_t request_id = 0, retry_count = 0;
         ObString rowkey_predicate;
@@ -108,19 +132,55 @@ int ObAIColumnTaskWorker::process_tasks()
             || OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(5), retry_count))) {
           OB_LOG(WARN, "read task cols failed", K(ret));
         } else {
-          int tmp_ret = process_one_task(tenant_id, table_id, column_id,
-                                         rowkey_predicate, request_id, retry_count);
-          if (OB_SUCCESS != tmp_ret) {
-            OB_LOG(WARN, "process one task failed", K(tmp_ret),
-                   K(tenant_id), K(table_id), K(column_id));
+          ObArenaAllocator task_alloc("ai_task_rowkey");
+          ObString rowkey_copy;
+          OB_LOG(INFO, "process one ai task", K(task_count), K(tenant_id),
+                 K(table_id), K(column_id), K(request_id), K(retry_count));
+          if (rowkey_predicate.empty() || OB_ISNULL(rowkey_predicate.ptr())) {
+            ret = OB_INVALID_ARGUMENT;
+            OB_LOG(ERROR, "invalid ai task rowkey", K(ret), K(tenant_id),
+                   K(table_id), K(column_id), K(request_id));
+          } else if (OB_FAIL(ob_write_string(task_alloc, rowkey_predicate, rowkey_copy))) {
+            OB_LOG(WARN, "copy ai task rowkey failed", K(ret));
+          } else {
+            fprintf(stderr,
+                    "[FIX] process task table=%ld col=%ld request=%ld rowkey_len=%d\n",
+                    table_id, column_id, request_id, rowkey_copy.length());
+            fflush(stderr);
+            int tmp_ret = process_one_task(tenant_id, table_id, column_id,
+                                           rowkey_copy, request_id, retry_count);
+            if (OB_SUCCESS != tmp_ret) {
+              OB_LOG(WARN, "process one task failed", K(tmp_ret),
+                     K(tenant_id), K(table_id), K(column_id));
+            } else {
+              OB_LOG(INFO, "process one task finished", K(tenant_id),
+                     K(table_id), K(column_id), K(request_id));
+            }
+          }
+          if (OB_FAIL(ret)) {
+            char cleanup_buf[1024];
+            snprintf(cleanup_buf, sizeof(cleanup_buf),
+                     "DELETE FROM oceanbase.__all_ai_column_task "
+                     "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+                     "AND request_id=%ld",
+                     tenant_id, table_id, column_id, request_id);
+            int64_t cleanup_affected = 0;
+            int cleanup_ret = sql_proxy_->write(cleanup_buf, cleanup_affected);
+            if (OB_SUCCESS != cleanup_ret) {
+              OB_LOG(WARN, "cleanup malformed ai task failed", K(cleanup_ret),
+                     K(table_id), K(column_id), K(request_id));
+            }
+            break;
           }
         }
       }
     }
   }
+  OB_LOG(INFO, "process ai tasks finished", K(ret), K(task_count));
   return ret;
 }
 
+static FILE *debug_fp = fopen("/tmp/retry_fix.log", "a");
 int ObAIColumnTaskWorker::process_one_task(
     int64_t tenant_id, int64_t table_id, int64_t column_id,
     const ObString &rowkey_predicate, int64_t request_id, int64_t retry_count)
@@ -177,10 +237,12 @@ int ObAIColumnTaskWorker::process_one_task(
             || OB_FAIL(res.get_result()->get_int(static_cast<int64_t>(2), max_retries))
             || OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(3), tmp_state_column))) {
           OB_LOG(WARN, "read ai_column meta cols failed", K(ret));
-        } else {
-          ob_write_string(alloc, tmp_model, model_name);
-          ob_write_string(alloc, tmp_expr, normalized_expr);
-          ob_write_string(alloc, tmp_state_column, state_column_name);
+        } else if (OB_FAIL(ob_write_string(alloc, tmp_model, model_name))) {
+          OB_LOG(WARN, "copy ai model name failed", K(ret));
+        } else if (OB_FAIL(ob_write_string(alloc, tmp_expr, normalized_expr))) {
+          OB_LOG(WARN, "copy ai normalized expr failed", K(ret));
+        } else if (OB_FAIL(ob_write_string(alloc, tmp_state_column, state_column_name))) {
+          OB_LOG(WARN, "copy ai column state name failed", K(ret));
         }
       }
     }
@@ -246,6 +308,8 @@ int ObAIColumnTaskWorker::process_one_task(
   // 4. 调真实模型（Mock HTTP）。The result is guarded atomically at writeback.
   ObString ai_result;
   if (OB_SUCC(ret)) {
+    fprintf(debug_fp, "[FIX] model call begin table=%ld col=%ld\n", table_id, column_id);
+    fflush(stderr);
     ObString ep_url, ep_req_model;
     {
       SMART_VAR(ObMySQLProxy::MySQLResult, res) {
@@ -371,6 +435,13 @@ int ObAIColumnTaskWorker::process_one_task(
       }
     }
   }
+  if (OB_SUCC(ret)) {
+    fprintf(debug_fp, "[FIX] model call end ret=%d\n", ret);
+    fflush(stderr);
+  } else {
+    fprintf(debug_fp, "[FIX] model call failed ret=%d\n", ret);
+    fflush(stderr);
+  }
 
   // 6. 写回真实结果（SQL 转义：\ 和 ' 都双写）
   if (OB_SUCC(ret) && !ai_result.empty()) {
@@ -450,79 +521,111 @@ int ObAIColumnTaskWorker::process_one_task(
     int64_t new_retry = retry_count + 1;
     OB_LOG(WARN, "worker non-success branch", K(ret), K(new_retry), K(max_retries));
     if (new_retry > max_retries) {
-      // Terminal failure: persist FAILED for strict read, then remove the completed task.
-      snprintf(sql_buf, sizeof(sql_buf),
-               "UPDATE %.*s.%.*s SET %.*s=3 WHERE %.*s",
-               database_name.length(), database_name.ptr(),
-               table_name.length(), table_name.ptr(),
-               state_column_name.length(), state_column_name.ptr(),
-               rowkey_predicate.length(), rowkey_predicate.ptr());
-      int64_t state_affected = 0;
-      int state_ret = sql_proxy_->write(sql_buf, state_affected);
-      if (OB_SUCCESS != state_ret) {
-        OB_LOG(WARN, "persist ai column failed state failed", K(state_ret), K(sql_buf));
-      }
-      if (OB_SUCCESS == state_ret && 0 == state_affected) {
-        // affected_rows may be zero when the state is already FAILED. Verify the
-        // persisted value instead of issuing an unsafe REPLACE of the user row.
-        char state_check_buf[4096];
-        snprintf(state_check_buf, sizeof(state_check_buf),
-                 "SELECT %.*s FROM %.*s.%.*s WHERE %.*s",
-                 state_column_name.length(), state_column_name.ptr(),
-                 database_name.length(), database_name.ptr(),
-                 table_name.length(), table_name.ptr(),
-                 rowkey_predicate.length(), rowkey_predicate.ptr());
-        SMART_VAR(ObMySQLProxy::MySQLResult, state_res) {
-          int64_t persisted_state = -1;
-          int check_ret = sql_proxy_->read(state_res, state_check_buf);
-          if (OB_SUCCESS != check_ret) {
-            state_ret = check_ret;
-          } else if (OB_ISNULL(state_res.get_result())
-                     || OB_SUCCESS != state_res.get_result()->next()) {
-            state_ret = OB_ENTRY_NOT_EXIST;
-          } else if (OB_SUCCESS != (state_ret =
-                     state_res.get_result()->get_int(static_cast<int64_t>(0), persisted_state))) {
-          } else if (3 != persisted_state) {
-            state_ret = OB_ERR_UNEXPECTED;
-          } else {
-            state_affected = 1;
-            state_ret = OB_SUCCESS;
-          }
-        }
-      }
-      fprintf(stderr, "[FIX] terminal col=%.*s ret=%d state_ret=%d affected=%ld sql=%s\n",
-              state_column_name.length(), state_column_name.ptr(),
-              ret, state_ret, state_affected, sql_buf); fflush(stderr);
-      if (OB_SUCCESS == state_ret) {
+      if (state_column_name.empty() || OB_ISNULL(state_column_name.ptr())
+          || rowkey_predicate.empty() || OB_ISNULL(rowkey_predicate.ptr())
+          || database_name.empty() || OB_ISNULL(database_name.ptr())
+          || table_name.empty() || OB_ISNULL(table_name.ptr())) {
+        fprintf(debug_fp, "[FIX] terminal invalid key cleanup\n");
+        fflush(stderr);
+        OB_LOG(ERROR, "invalid ai terminal failure key", K(ret),
+               K(state_column_name), K(rowkey_predicate),
+               K(tenant_id), K(table_id), K(column_id), K(request_id));
         snprintf(sql_buf, sizeof(sql_buf),
                  "DELETE FROM oceanbase.__all_ai_column_task "
                  "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
-                 "AND rowkey_predicate='%.*s' AND request_id=%ld",
-                 tenant_id, table_id, column_id,
-                 rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
-        int64_t task_affected = 0;
-        int task_ret = sql_proxy_->write(sql_buf, task_affected);
-        if (OB_SUCCESS != task_ret) {
-          OB_LOG(WARN, "delete terminal ai task failed", K(task_ret), K(sql_buf));
-        }
+                 "AND request_id=%ld",
+                 tenant_id, table_id, column_id, request_id);
+        int64_t cleanup_affected = 0;
+        sql_proxy_->write(sql_buf, cleanup_affected);
+        ret = OB_SUCCESS;
       } else {
-        // Leave the task retryable if FAILED state cannot be persisted.
+        // Terminal failure: persist FAILED for strict read, then remove the completed task.
+        const int state_col_len = safe_string_length(state_column_name);
+        const char *state_col_ptr = safe_string_ptr(state_column_name);
+        const int rowkey_len = safe_string_length(rowkey_predicate);
+        const char *rowkey_ptr = safe_string_ptr(rowkey_predicate);
+        fprintf(debug_fp, "[FIX] terminal state update begin\n");
+        fflush(stderr);
         snprintf(sql_buf, sizeof(sql_buf),
-                 "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=1 "
-                 "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
-                 "AND rowkey_predicate='%.*s' AND request_id=%ld",
-                 new_retry, tenant_id, table_id, column_id,
-                 rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
-        int64_t affected = 0;
-        sql_proxy_->write(sql_buf, affected);
+                 "UPDATE %.*s.%.*s SET %.*s=3 WHERE %.*s",
+                 database_name.length(), database_name.ptr(),
+                 table_name.length(), table_name.ptr(),
+                 state_col_len, state_col_ptr,
+                 rowkey_len, rowkey_ptr);
+        int64_t state_affected = 0;
+        int state_ret = sql_proxy_->write(sql_buf, state_affected);
+        fprintf(debug_fp, "[FIX] terminal state write ret=%d affected=%ld\n",
+                state_ret, state_affected);
+        fflush(stderr);
+        if (OB_SUCCESS != state_ret) {
+          OB_LOG(WARN, "persist ai column failed state failed", K(state_ret), K(sql_buf));
+        }
+        if (OB_SUCCESS == state_ret && 0 == state_affected) {
+          // affected_rows may be zero when the state is already FAILED. Verify the
+          // persisted value instead of issuing an unsafe REPLACE of the user row.
+          char state_check_buf[4096];
+          snprintf(state_check_buf, sizeof(state_check_buf),
+                   "SELECT %.*s FROM %.*s.%.*s WHERE %.*s",
+                   state_col_len, state_col_ptr,
+                   database_name.length(), database_name.ptr(),
+                   table_name.length(), table_name.ptr(),
+                   rowkey_len, rowkey_ptr);
+          SMART_VAR(ObMySQLProxy::MySQLResult, state_res) {
+            int64_t persisted_state = -1;
+            int check_ret = sql_proxy_->read(state_res, state_check_buf);
+            if (OB_SUCCESS != check_ret) {
+              state_ret = check_ret;
+            } else if (OB_ISNULL(state_res.get_result())
+                       || OB_SUCCESS != state_res.get_result()->next()) {
+              state_ret = OB_ENTRY_NOT_EXIST;
+            } else if (OB_SUCCESS != (state_ret =
+                       state_res.get_result()->get_int(static_cast<int64_t>(0), persisted_state))) {
+            } else if (3 != persisted_state) {
+              state_ret = OB_ERR_UNEXPECTED;
+            } else {
+              state_affected = 1;
+              state_ret = OB_SUCCESS;
+            }
+          }
+        }
+        OB_LOG(WARN, "[FIX] terminal fail", K(ret), K(state_ret), K(state_affected),
+               K(state_column_name), K(rowkey_predicate), K(sql_buf));
+        fprintf(debug_fp, "[FIX] terminal fail ret=%d state_ret=%d affected=%ld\n",
+                ret, state_ret, state_affected);
+        fflush(stderr);
+        if (OB_SUCCESS == state_ret) {
+          snprintf(sql_buf, sizeof(sql_buf),
+                   "DELETE FROM oceanbase.__all_ai_column_task "
+                   "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+                   "AND rowkey_predicate='%.*s' AND request_id=%ld",
+                   tenant_id, table_id, column_id,
+                   rowkey_len, rowkey_ptr, request_id);
+          int64_t task_affected = 0;
+          int task_ret = sql_proxy_->write(sql_buf, task_affected);
+          if (OB_SUCCESS != task_ret) {
+            OB_LOG(WARN, "delete terminal ai task failed", K(task_ret), K(sql_buf));
+          }
+        } else {
+          // Leave the task retryable if FAILED state cannot be persisted.
+          snprintf(sql_buf, sizeof(sql_buf),
+                   "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=1 "
+                   "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
+                   "AND rowkey_predicate='%.*s' AND request_id=%ld",
+                   new_retry, tenant_id, table_id, column_id,
+                   rowkey_len, rowkey_ptr, request_id);
+          int64_t affected = 0;
+          sql_proxy_->write(sql_buf, affected);
+        }
       }
     } else {
+      const int rowkey_len = safe_string_length(rowkey_predicate);
+      const char *rowkey_ptr = safe_string_ptr(rowkey_predicate);
       snprintf(sql_buf, sizeof(sql_buf),
                "UPDATE oceanbase.__all_ai_column_task SET retry_count=%ld, state=1 "
                "WHERE tenant_id=%ld AND table_id=%ld AND column_id=%ld "
                "AND rowkey_predicate='%.*s' AND request_id=%ld",
                new_retry, tenant_id, table_id, column_id,
-               rowkey_predicate.length(), rowkey_predicate.ptr(), request_id);
+               rowkey_len, rowkey_ptr, request_id);
       int64_t affected = 0;
       sql_proxy_->write(sql_buf, affected);
     }
@@ -536,14 +639,19 @@ void ObAIColumnTaskWorker::runTimerTask()
 {
   int ret = OB_SUCCESS;
   if (!inited_) {
+    { FILE *fp = fopen("/tmp/worker_tick.log", "a"); if (fp) { fprintf(fp, "tick inited=0 skip\n"); fclose(fp); } }
   } else {
     int64_t affected = 0;
-    if (OB_FAIL(claim_tasks(affected))) {
+    int claim_ret = claim_tasks(affected);
+    { FILE *fp = fopen("/tmp/worker_tick.log", "a"); if (fp) { fprintf(fp, "tick claim_ret=%d affected=%ld\n", claim_ret, affected); fclose(fp); } }
+    if (OB_FAIL(claim_ret)) {
+      ret = claim_ret;
     } else if (affected == 0) {
     } else {
-      OB_LOG(INFO, "ai task worker claimed", K(affected));
-      if (OB_FAIL(process_tasks())) {
-        OB_LOG(WARN, "process ai tasks failed", K(ret));
+      int process_ret = process_tasks();
+      { FILE *fp = fopen("/tmp/worker_tick.log", "a"); if (fp) { fprintf(fp, "tick process_ret=%d\n", process_ret); fclose(fp); } }
+      if (OB_FAIL(process_ret)) {
+        ret = process_ret;
       }
     }
   }

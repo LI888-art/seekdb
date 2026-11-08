@@ -849,6 +849,7 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
           int cli_ret = OB_SUCCESS;
           retry_ctrl_.test_and_save_retry_state(gctx_, ctx_, result, ret, cli_ret);
           ret = cli_ret;
+          need_response_error = true;
           if (ctx_.multi_stmt_item_.is_batched_multi_stmt()) {
             // batch execute with error,should not response error packet
             need_response_error = false;
@@ -856,6 +857,7 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
             need_response_error = false;
           }
         } else {
+          need_response_error = false;
           retry_ctrl_.set_packet_retry();
           session.get_retry_info_for_update().set_last_query_retry_err(ret);
           session.get_retry_info_for_update().inc_retry_cnt();

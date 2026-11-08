@@ -976,6 +976,10 @@ void ObServer::destroy()
     server_gtimer_.destroy();
     FLOG_INFO("server timer destroyed");
 
+    FLOG_INFO("begin to destroy ai column timer");
+    ai_column_timer_.destroy();
+    FLOG_INFO("ai column timer destroyed");
+
     FLOG_INFO("begin to destroy sql memory manager timer");
     sql_mem_timer_.destroy();
     FLOG_INFO("sql memory manager timer destroyed");
@@ -1605,6 +1609,10 @@ int ObServer::stop()
     server_gtimer_.stop();
     FLOG_INFO("timer stopped");
 
+    FLOG_INFO("begin to stop ai column timer");
+    ai_column_timer_.stop();
+    FLOG_INFO("ai column timer stopped");
+
     FLOG_INFO("begin to stop sql memory manager timer");
     sql_mem_timer_.stop();
     FLOG_INFO("sql memory manager timer stopped");
@@ -1940,6 +1948,7 @@ int ObServer::init_config_module()
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("local address isn't valid", K(self_addr_), KR(ret));
   } else if (OB_FAIL(server_gtimer_.init("ServerGTimer", ObMemAttr("ServerGTimer")))) {
+  } else if (OB_FAIL(ai_column_timer_.init("AIColumnTimer", ObMemAttr("AIColumnTimer")))) {
   } else if (OB_FAIL(sql_mem_timer_.init("SqlMemTimer", ObMemAttr("SqlMemTimer")))) {
   } else if (OB_FAIL(ctas_clean_up_timer_.init("CTASCleanUp", ObMemAttr("CTASCleanUp")))) {
   }
@@ -2197,7 +2206,12 @@ int ObServer::init_server_runtime()
   // 注册 AI 列任务 worker（2s 间隔）
   if (OB_SUCC(ret)) {
     if (OB_FAIL(ai_column_task_worker_.init(&sql_proxy_))) {
-    } else if (OB_FAIL(server_gtimer_.schedule(ai_column_task_worker_, 2000000, true))) {
+    } else if (OB_FAIL(ai_column_timer_.schedule_repeate_task_immediately(
+                           ai_column_task_worker_, 2000000))) {
+    } else {
+      const bool task_exists = ai_column_timer_.task_exist(ai_column_task_worker_);
+      LOG_INFO("ai column task worker scheduled",
+               K(ai_column_timer_), K(task_exists));
     }
     // 中断恢复: 把上次崩溃遗留的 PROCESSING(state=2) 任务重置为 PENDING(state=1)
     if (OB_SUCC(ret)) {

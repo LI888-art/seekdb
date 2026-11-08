@@ -13906,7 +13906,7 @@ static const _error _error_OB_AI_FUNC_MODEL_EXISTS = {
 };
 static const _error _error_OB_ERR_AI_COLUMN_NOT_READY = {
       .error_name            = "OB_ERR_AI_COLUMN_NOT_READY",
-      .error_cause           = "AI column is not ready for strict read",
+      .error_cause           = "AI column has unfinished tasks for table_id=%ld, column_id=%ld",
       .error_solution        = "AI column has pending tasks or failed results",
       .mysql_errno           = -1,
       .sqlstate              = "HY000",

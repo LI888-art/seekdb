@@ -179,6 +179,148 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                                               ObSchemaGetterGuard *schema_guard,
                                               ObMySQLProxy *sql_proxy);
 
+static bool is_ai_status_ident_char(const char c)
+{
+  return (c >= 'a' && c <= 'z')
+      || (c >= 'A' && c <= 'Z')
+      || (c >= '0' && c <= '9')
+      || '_' == c
+      || '$' == c;
+}
+
+static int rewrite_ai_retry_status(const ObString &where_cond,
+                                   const ObString &state_col_name,
+                                   ObIAllocator &allocator,
+                                   ObString &rewritten)
+{
+  int ret = OB_SUCCESS;
+  const char *sql = where_cond.ptr();
+  const int64_t len = where_cond.length();
+  ObSqlString output;
+  for (int64_t i = 0; OB_SUCC(ret) && i < len;) {
+    const char c = sql[i];
+    if ('\'' == c || '"' == c || '`' == c) {
+      const char quote = c;
+      if (OB_FAIL(output.append(sql + i, 1))) {
+      } else {
+        ++i;
+        while (OB_SUCC(ret) && i < len) {
+          const char qc = sql[i];
+          if (OB_FAIL(output.append(sql + i, 1))) {
+          } else {
+            ++i;
+            if ('\\' == qc && i < len) {
+              if (OB_FAIL(output.append(sql + i, 1))) {
+              } else {
+                ++i;
+              }
+            } else if (quote == qc) {
+              if (i < len && quote == sql[i]) {
+                if (OB_FAIL(output.append(sql + i, 1))) {
+                } else {
+                  ++i;
+                }
+              } else {
+                break;
+              }
+            }
+          }
+        }
+      }
+    } else if ('-' == c && i + 1 < len && '-' == sql[i + 1]) {
+      while (OB_SUCC(ret) && i < len) {
+        const char cc = sql[i++];
+        if (OB_FAIL(output.append(&cc, 1))) {
+        } else if ('\n' == cc) {
+          break;
+        }
+      }
+    } else if ('/' == c && i + 1 < len && '*' == sql[i + 1]) {
+      while (OB_SUCC(ret) && i < len) {
+        const char cc = sql[i++];
+        if (OB_FAIL(output.append(&cc, 1))) {
+        } else if ('*' == cc && i < len && '/' == sql[i]) {
+          if (OB_FAIL(output.append(sql + i, 1))) {
+          } else {
+            ++i;
+            break;
+          }
+        }
+      }
+    } else if ('#' == c) {
+      while (OB_SUCC(ret) && i < len) {
+        const char cc = sql[i++];
+        if (OB_FAIL(output.append(&cc, 1))) {
+        } else if ('\n' == cc) {
+          break;
+        }
+      }
+    } else if ((0 == i
+                || ('.' != sql[i - 1] && '@' != sql[i - 1]
+                    && !is_ai_status_ident_char(sql[i - 1])))
+               && i + 6 <= len && 0 == strncasecmp(sql + i, "status", 6)
+               && (i + 6 == len || !is_ai_status_ident_char(sql[i + 6]))) {
+      int64_t j = i + 6;
+      while (j < len && (' ' == sql[j] || '\t' == sql[j]
+                         || '\r' == sql[j] || '\n' == sql[j])) {
+        ++j;
+      }
+      int64_t state = -1;
+      int64_t value_end = -1;
+      if (j < len && '=' == sql[j]) {
+        ++j;
+        while (j < len && (' ' == sql[j] || '\t' == sql[j]
+                           || '\r' == sql[j] || '\n' == sql[j])) {
+          ++j;
+        }
+        if (j < len && ('\'' == sql[j] || '"' == sql[j])) {
+          const char quote = sql[j++];
+          const int64_t value_begin = j;
+          while (j < len && sql[j] != quote) {
+            if ('\\' == sql[j]) {
+              ++j;
+            }
+            ++j;
+          }
+          if (j < len) {
+            value_end = j + 1;
+            const int64_t value_len = j - value_begin;
+            if (7 == value_len
+                && 0 == strncasecmp(sql + value_begin, "PENDING", 7)) {
+              state = 1;
+            } else if (5 == value_len
+                       && 0 == strncasecmp(sql + value_begin, "READY", 5)) {
+              state = 0;
+            } else if (6 == value_len
+                       && 0 == strncasecmp(sql + value_begin, "FAILED", 6)) {
+              state = 3;
+            }
+          }
+        }
+      }
+      if (state >= 0) {
+        if (OB_FAIL(output.append_fmt("`%.*s` = %ld",
+                                      state_col_name.length(), state_col_name.ptr(),
+                                      state))) {
+        } else {
+          i = value_end;
+        }
+      } else if (OB_FAIL(output.append_fmt("`%.*s`",
+                                           state_col_name.length(),
+                                           state_col_name.ptr()))) {
+      } else {
+        i += 6;
+      }
+    } else if (OB_FAIL(output.append(sql + i, 1))) {
+    } else {
+      ++i;
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ob_write_string(allocator, output.string(), rewritten))) {
+  }
+  return ret;
+}
+
 static int execute_retry_ai_column(ObAlterTableStmt *alter_stmt,
                                    ObSQLSessionInfo *session,
                                    ObSchemaGetterGuard *schema_guard,
@@ -196,16 +338,19 @@ static int execute_retry_ai_column(ObAlterTableStmt *alter_stmt,
     const ObString &where_sql = alter_stmt->get_retry_where_sql();
     const ObString &db_name = alter_stmt->get_database_name();
     const ObString &table_name = alter_stmt->get_table_name();
-    // 1. 查 __all_ai_column 验证是 AI 列 + 拿 table_id / column_id / state_col_id / result_col_id
+    // 1. 查 __all_ai_column 验证是 AI 列 + 拿结果列和状态列名
     int64_t table_id = 0, column_id = 0, state_col_id = 0, result_col_id = 0;
-    ObString result_col_name;
+    ObString result_col_name, state_col_name;
     {
       SMART_VAR(ObMySQLProxy::MySQLResult, res) {
         snprintf(sql_buf, sizeof(sql_buf),
-                 "SELECT ac.table_id, ac.column_id, ac.state_column_id, ac.result_spec_column_id, ac.column_name "
+                 "SELECT ac.table_id, ac.column_id, ac.state_column_id, ac.result_spec_column_id, "
+                 "ac.column_name, state_col.column_name "
                  "FROM oceanbase.__all_ai_column ac "
                  "JOIN oceanbase.__all_table t ON ac.table_id = t.table_id "
                  "JOIN oceanbase.__all_database d ON t.database_id = d.database_id "
+                 "JOIN oceanbase.__all_column state_col ON state_col.table_id = ac.table_id "
+                 "AND state_col.column_id = ac.state_column_id "
                  "WHERE d.database_name='%.*s' AND t.table_name='%.*s' AND ac.column_name='%.*s'",
                  db_name.length(), db_name.ptr(),
                  table_name.length(), table_name.ptr(),
@@ -214,22 +359,29 @@ static int execute_retry_ai_column(ObAlterTableStmt *alter_stmt,
           LOG_WARN("query ai_column meta failed", K(ret), K(sql_buf));
         } else if (OB_ISNULL(res.get_result()) || OB_SUCCESS != res.get_result()->next()) {
           ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "RETRY on non AI column");
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
           LOG_WARN("retry on non ai column", K(ret), K(col_name));
         } else {
-          ObString tmp_cn;
+          ObString tmp_cn, tmp_state_cn;
           res.get_result()->get_int(static_cast<int64_t>(0), table_id);
           res.get_result()->get_int(static_cast<int64_t>(1), column_id);
           res.get_result()->get_int(static_cast<int64_t>(2), state_col_id);
           res.get_result()->get_int(static_cast<int64_t>(3), result_col_id);
-          res.get_result()->get_varchar(static_cast<int64_t>(4), tmp_cn);
-          ob_write_string(alloc, tmp_cn, result_col_name);
+          if (OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(4), tmp_cn))
+              || OB_FAIL(res.get_result()->get_varchar(static_cast<int64_t>(5), tmp_state_cn))) {
+          } else if (OB_FAIL(ob_write_string(alloc, tmp_cn, result_col_name))
+                     || OB_FAIL(ob_write_string(alloc, tmp_state_cn, state_col_name))) {
+          }
         }
       }
     }
     // 2. 拼 WHERE 条件（where_sql 是 "WHERE xxx" 或空）
     ObString where_cond;
-    if (OB_SUCC(ret)) {
+    if (OB_SUCC(ret) && (result_col_name.empty() || state_col_name.empty())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("retry ai column names are empty", K(ret), K(result_col_name),
+               K(state_col_name), K(col_name));
+    } else if (OB_SUCC(ret)) {
       if (where_sql.empty()) {
         where_cond = ObString::make_string("1=1");
       } else if (where_sql.length() > 6 && 0 == strncasecmp(where_sql.ptr(), "WHERE ", 6)) {
@@ -238,13 +390,21 @@ static int execute_retry_ai_column(ObAlterTableStmt *alter_stmt,
         where_cond = where_sql;
       }
     }
-    // 3. 清空 result 列（让严格读取能检测到未就绪）
+    ObString rewritten_where_cond;
+    if (OB_SUCC(ret)
+        && OB_FAIL(rewrite_ai_retry_status(where_cond, state_col_name,
+                                           alloc, rewritten_where_cond))) {
+    } else if (OB_SUCC(ret)) {
+      where_cond = rewritten_where_cond;
+    }
+    // 3. 清空 result 列并标记 PENDING，避免沿用旧 READY 状态。
     if (OB_SUCC(ret)) {
       snprintf(sql_buf, sizeof(sql_buf),
-               "UPDATE %.*s.%.*s SET %.*s=NULL WHERE %.*s",
+               "UPDATE %.*s.%.*s SET %.*s=NULL, %.*s=1 WHERE %.*s",
                db_name.length(), db_name.ptr(),
                table_name.length(), table_name.ptr(),
                result_col_name.length(), result_col_name.ptr(),
+               state_col_name.length(), state_col_name.ptr(),
                where_cond.length(), where_cond.ptr());
       int64_t affected = 0;
       if (OB_FAIL(sql_proxy->write(sql_buf, affected))) {
@@ -305,6 +465,7 @@ int ObSql::stmt_query(const common::ObString &stmt, ObSqlCtx &context, ObResultS
         &result.get_session(),
         context.schema_guard_,
         GCTX.sql_proxy_))) {
+      result.set_errcode(ret);
       LOG_WARN("strict read check failed", K(ret));
     }
   }
@@ -2077,6 +2238,13 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   ObExecContext& ectx = result.get_exec_context();
   int get_plan_err = OB_SUCCESS; //used for judge whether add plan to plan cache
   bool use_plan_cache = session.get_local_ob_enable_plan_cache();
+  bool strict_read = false;
+  if (use_plan_cache
+      && OB_FAIL(session.get_bool_sys_var(SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+  } else if (use_plan_cache && strict_read) {
+    // Strict read must run the resolver so context.cur_stmt_ is populated.
+    use_plan_cache = false;
+  }
   ObPlanCacheCtx *pc_ctx = NULL;
   bool is_begin_commit_stmt = false;
 
@@ -2131,6 +2299,19 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
 
   if ((NULL != pc_ctx) && !(pc_ctx->sql_ctx_.is_sensitive_)) {
     // if sql context contains sensitive data, can not flush sql info to trace.log
+  }
+
+  if (strict_read) {
+    FILE *fp = fopen("/tmp/strict_flow.log", "a");
+    if (fp) {
+      fprintf(fp,
+              "strict_flow strict_read=%d use_plan_cache=%d plan_cache_hit=%d "
+              "cur_stmt_null=%d ret=%d sql=%.*s\n",
+              strict_read, use_plan_cache, context.plan_cache_hit_,
+              OB_ISNULL(context.cur_stmt_), ret,
+              trimed_stmt.length(), trimed_stmt.ptr());
+      fclose(fp);
+    }
   }
 
   // set auto-increment related param into physical plan ctx
@@ -2194,7 +2375,7 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
         ObSqlString ac_sql;
         if (OB_FAIL(ac_sql.append_fmt(
               "SELECT ac.column_id, ac.state_column_id, ac.request_column_id, ac.result_spec_column_id, "
-              "state_col.column_name "
+              "state_col.column_name, ac.column_name, t.table_id "
               "FROM oceanbase.__all_ai_column ac "
               "JOIN oceanbase.__all_table t ON ac.table_id = t.table_id "
               "JOIN oceanbase.__all_database d ON t.database_id = d.database_id "
@@ -2215,19 +2396,30 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                 if (OB_ITER_END == next_ret) { break; }
                 else if (OB_FAIL(next_ret)) { ret = next_ret; break; }
                 int64_t ac_id = 0, st_id = 0, rq_id = 0, rs_id = 0;
+                int64_t ai_table_id = 0;
                 char state_col_name[256];
+                char result_col_name[256];
                 int64_t state_col_name_len = 0;
+                int64_t result_col_name_len = 0;
                 ObString tmp_state_col_name;
+                ObString tmp_result_col_name;
                 if (OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(0), ac_id))
                     || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(1), st_id))
                     || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(2), rq_id))
                     || OB_FAIL(ac_res.get_result()->get_int(static_cast<int64_t>(3), rs_id))
                     || OB_FAIL(ac_res.get_result()->get_varchar(
-                               static_cast<int64_t>(4), tmp_state_col_name))) {
+                               static_cast<int64_t>(4), tmp_state_col_name))
+                    || OB_FAIL(ac_res.get_result()->get_varchar(
+                               static_cast<int64_t>(5), tmp_result_col_name))
+                    || OB_FAIL(ac_res.get_result()->get_int(
+                               static_cast<int64_t>(6), ai_table_id))) {
                 } else {
                   state_col_name_len = snprintf(state_col_name, sizeof(state_col_name),
                                                 "%.*s", tmp_state_col_name.length(),
                                                 tmp_state_col_name.ptr());
+                  result_col_name_len = snprintf(result_col_name, sizeof(result_col_name),
+                                                 "%.*s", tmp_result_col_name.length(),
+                                                 tmp_result_col_name.ptr());
                   bool referenced = false;
                   for (int64_t c = 0; !referenced && c < col_exprs.count(); ++c) {
                     ObRawExpr *ce = col_exprs.at(c);
@@ -2266,11 +2458,12 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                     if (OB_SUCC(ret)
                         && OB_FAIL(state_sql.append_fmt(
                            "SELECT COUNT(*) FROM `%.*s`.`%.*s` "
-                           "WHERE `%.*s` IS NULL OR `%.*s` != 0",
+                           "WHERE `%.*s` IS NULL OR `%.*s` != 0 OR `%.*s` IS NULL",
                            db_name.length(), db_name.ptr(),
                            table->table_name_.length(), table->table_name_.ptr(),
                            static_cast<int>(state_col_name_len), state_col_name,
-                           static_cast<int>(state_col_name_len), state_col_name))) {
+                           static_cast<int>(state_col_name_len), state_col_name,
+                           static_cast<int>(result_col_name_len), result_col_name))) {
                       LOG_WARN("build ai column state sql failed", K(ret));
                     } else if (OB_SUCC(ret)) {
                       SMART_VAR(ObMySQLProxy::MySQLResult, state_res) {
@@ -2287,12 +2480,31 @@ static int check_ai_column_strict_read_exec(ObDMLStmt *stmt,
                     }
                     ObString state_col_str(static_cast<int32_t>(state_col_name_len),
                                            state_col_name);
-                    fprintf(stderr, "[FIX] state_check ac_id=%ld col=%.*s task=%ld not_ready=%ld\n",
+                    ObString result_col_str(static_cast<int32_t>(result_col_name_len),
+                                            result_col_name);
+                    {
+                      FILE *fp = fopen("/tmp/state_check.log", "a");
+                      if (fp) {
+                        fprintf(fp,
+                                "state_check ac_id=%ld state_col=%.*s result_col=%.*s "
+                                "task_count=%ld not_ready=%ld referenced=%d\n",
+                                ac_id,
+                                static_cast<int>(state_col_name_len), state_col_name,
+                                static_cast<int>(result_col_name_len), result_col_name,
+                                task_count, not_ready_count, referenced);
+                        fclose(fp);
+                      }
+                    }
+                    fprintf(stderr,
+                            "[FIX] state_check ac_id=%ld state_col=%.*s result_col=%.*s "
+                            "task=%ld not_ready=%ld\n",
                             ac_id, state_col_str.length(), state_col_str.ptr(),
-                            task_count, not_ready_count); fflush(stderr);
+                            result_col_str.length(), result_col_str.ptr(),
+                            task_count, not_ready_count);
+                    fflush(stderr);
                     if (OB_SUCC(ret) && (task_count > 0 || not_ready_count > 0)) {
                       ret = OB_ERR_AI_COLUMN_NOT_READY;
-                      LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY);
+                      LOG_USER_ERROR(OB_ERR_AI_COLUMN_NOT_READY, ai_table_id, ac_id);
                     }
                   }
                   if (OB_FAIL(ret)) break;

@@ -702,8 +702,8 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
     if (OB_SUCC(ret) && alter_table_stmt->has_retry_ai_column()
         && alter_table_stmt->get_alter_table_action_count() > 1) {
       ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "RETRY AI COLUMN cannot be mixed with other actions");
-      SQL_RESV_LOG(WARN, "RETRY AI COLUMN cannot be mixed with other actions", K(ret));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+      SQL_RESV_LOG(WARN, "combining AI COLUMN RETRY with another ALTER action", K(ret));
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(check_skip_index(alter_table_stmt->get_alter_table_arg().alter_table_schema_))) {

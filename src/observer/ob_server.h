@@ -483,6 +483,7 @@ private:
   common::ObMysqlRandom scramble_rand_;
   common::ObTimer server_gtimer_;
   ObAIColumnTaskWorker ai_column_task_worker_;
+  common::ObTimer ai_column_timer_;
   common::ObTimer sql_mem_timer_;
   common::ObTimer ctas_clean_up_timer_;
   ObServerDutyTask duty_task_;
