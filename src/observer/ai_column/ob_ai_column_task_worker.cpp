@@ -5,6 +5,7 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/allocator/ob_allocator.h"
 #include "common/mysqlclient/ob_mysql_proxy.h"
+#include "common/mysqlclient/ob_mysql_transaction.h"
 #include "common/mysqlclient/ob_mysql_result.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_smart_var.h"
@@ -154,7 +155,7 @@ static int append_sql_string_literal(ObSqlString &sql, const ObString &value)
 }
 
 static int publish_group_results(
-    ObMySQLProxy *sql_proxy,
+    ObMySQLTransaction *transaction,
     ObArray<ObAIColumnTaskSnapshot> &tasks,
     const int64_t seed,
     ObIAllocator &allocator)
@@ -180,7 +181,7 @@ static int publish_group_results(
                  "SELECT t.table_name, d.database_name FROM oceanbase.__all_table t "
                  "JOIN oceanbase.__all_database d ON t.database_id=d.database_id "
                  "WHERE t.table_id=%ld", first.table_id_);
-        if (OB_FAIL(sql_proxy->read(res, sql_buf))) {
+        if (OB_FAIL(transaction->read(res, sql_buf))) {
           OB_LOG(WARN, "publish group query table failed", K(ret),
                  K(first.table_id_));
         } else if (OB_ISNULL(res.get_result())
@@ -248,7 +249,7 @@ static int publish_group_results(
                      " AND request_id=%ld)", first.request_id_))) {
       } else {
         int64_t affected = 0;
-        if (OB_FAIL(sql_proxy->write(publish_sql.ptr(), affected))) {
+        if (OB_FAIL(transaction->write(publish_sql.ptr(), affected))) {
           OB_LOG(WARN, "publish AI task group failed", K(ret),
                  K(publish_sql));
         } else if (0 == affected) {
@@ -258,11 +259,6 @@ static int publish_group_results(
           OB_LOG(INFO, "AI task group published", K(first.table_id_),
                  K(first.request_id_), K(affected));
         }
-        for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
-          if (same_ai_task_group(first, tasks.at(i))) {
-            tasks.at(i).published_ = true;
-          }
-        }
       }
     }
   }
@@ -270,38 +266,30 @@ static int publish_group_results(
 }
 
 static int cleanup_published_group(
-    ObMySQLProxy *sql_proxy,
+    ObMySQLTransaction *transaction,
     ObArray<ObAIColumnTaskSnapshot> &tasks,
     const int64_t seed)
 {
   int ret = OB_SUCCESS;
   ObAIColumnTaskSnapshot &first = tasks.at(seed);
-  if (!first.published_ || first.cleaned_) {
+  char cleanup_buf[4096];
+  ObSqlString rowkey_literal;
+  if (OB_FAIL(append_sql_string_literal(
+          rowkey_literal, first.rowkey_predicate_))) {
   } else {
-    char cleanup_buf[4096];
-    ObSqlString rowkey_literal;
-    if (OB_FAIL(append_sql_string_literal(
-            rowkey_literal, first.rowkey_predicate_))) {
+    snprintf(cleanup_buf, sizeof(cleanup_buf),
+             "DELETE FROM oceanbase.__all_ai_column_task "
+             "WHERE tenant_id=%ld AND table_id=%ld "
+             "AND rowkey_predicate=%s AND request_id=%ld",
+             first.tenant_id_, first.table_id_, rowkey_literal.ptr(),
+             first.request_id_);
+    int64_t affected = 0;
+    if (OB_FAIL(transaction->write(cleanup_buf, affected))) {
+      OB_LOG(WARN, "cleanup published AI task group failed", K(ret),
+             K(cleanup_buf));
     } else {
-      snprintf(cleanup_buf, sizeof(cleanup_buf),
-               "DELETE FROM oceanbase.__all_ai_column_task "
-               "WHERE tenant_id=%ld AND table_id=%ld "
-               "AND rowkey_predicate=%s AND request_id=%ld",
-               first.tenant_id_, first.table_id_, rowkey_literal.ptr(),
-               first.request_id_);
-      int64_t affected = 0;
-      if (OB_FAIL(sql_proxy->write(cleanup_buf, affected))) {
-        OB_LOG(WARN, "cleanup published AI task group failed", K(ret),
-               K(cleanup_buf));
-      } else {
-        OB_LOG(INFO, "cleanup published AI task group",
-               K(first.table_id_), K(first.request_id_), K(affected));
-        for (int64_t i = 0; i < tasks.count(); ++i) {
-          if (same_ai_task_group(first, tasks.at(i))) {
-            tasks.at(i).cleaned_ = true;
-          }
-        }
-      }
+      OB_LOG(INFO, "cleanup published AI task group",
+             K(first.table_id_), K(first.request_id_), K(affected));
     }
   }
   return ret;
@@ -407,27 +395,40 @@ int ObAIColumnTaskWorker::process_tasks()
     }
   }
 
-  // Phase 4: publish each request group with one atomic UPDATE.
+  // Phase 4: publish results and remove the task group in one transaction.
   for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
     ObAIColumnTaskSnapshot &task = tasks.at(i);
-    if (!task.completed_ || task.published_) {
+    if (!task.completed_ || task.published_ || task.cleaned_) {
       continue;
     }
-    if (OB_FAIL(publish_group_results(sql_proxy_, tasks, i, task_alloc))) {
-      OB_LOG(WARN, "publish AI task group failed", K(ret),
+    ObMySQLTransaction transaction;
+    int group_ret = transaction.start(sql_proxy_);
+    if (OB_SUCCESS != group_ret) {
+      ret = group_ret;
+      OB_LOG(WARN, "start AI task group transaction failed", K(ret),
              K(task.table_id_), K(task.request_id_));
-    }
-  }
-
-  // Phase 5: remove all task rows belonging to a published request group.
-  for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
-    ObAIColumnTaskSnapshot &task = tasks.at(i);
-    if (!task.published_ || task.cleaned_) {
-      continue;
-    }
-    if (OB_FAIL(cleanup_published_group(sql_proxy_, tasks, i))) {
-      OB_LOG(WARN, "cleanup AI task group failed", K(ret),
-             K(task.table_id_), K(task.request_id_));
+    } else {
+      group_ret = publish_group_results(&transaction, tasks, i, task_alloc);
+      if (OB_SUCCESS == group_ret) {
+        group_ret = cleanup_published_group(&transaction, tasks, i);
+      }
+      int end_ret = transaction.end(OB_SUCCESS == group_ret);
+      if (OB_SUCCESS != group_ret) {
+        ret = group_ret;
+        OB_LOG(WARN, "publish and cleanup AI task group failed", K(ret),
+               K(task.table_id_), K(task.request_id_));
+      } else if (OB_SUCCESS != end_ret) {
+        ret = end_ret;
+        OB_LOG(WARN, "commit AI task group transaction failed", K(ret),
+               K(task.table_id_), K(task.request_id_));
+      } else {
+        for (int64_t j = 0; j < tasks.count(); ++j) {
+          if (same_ai_task_group(task, tasks.at(j))) {
+            tasks.at(j).published_ = true;
+            tasks.at(j).cleaned_ = true;
+          }
+        }
+      }
     }
   }
 
